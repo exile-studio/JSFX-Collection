@@ -1,0 +1,367 @@
+desc:Exile Pre
+// ------------------------------------------------------------
+// Exile Studio – JSFX Collection
+// Name   : Exile Pre
+// Version: 1.0
+// Author : Michele Raggi
+// Repo   : https://github.com/exile-studio/JSFX-Collection
+//
+// License: Creative Commons Attribution 4.0 International (CC BY 4.0)
+//          You are free to use, modify, and redistribute this file,
+//          including in commercial projects, as long as you provide
+//          appropriate credit to "exile_studio" and indicate if changes
+//          were made.
+//
+// Additional notes:
+//   All references to existing brands, products, hardware models,
+//   or company names are used purely for descriptive and comparative
+//   purposes. They are not endorsements, not affiliations, and 
+//   definitely not official models.
+//   And yes - they’re written in clear text because, honestly,
+//   who the fuck cares.
+//
+// Full license text:
+//   https://creativecommons.org/licenses/by/4.0/
+//
+// Support / warranty:
+//   None. Use at your own risk.
+// ------------------------------------------------------------
+
+// Sliders
+slider1: 0 < -24, 24, 0.1 > Input(dB)
+slider2: 0.35 < 0, 1, 0.01 > Color
+slider3: 0 < -24, 24, 0.1 > Output Trim(dB)
+slider4: 800 < 200, 12000, 1 > Crossover(Hz)
+slider5: 0 < 0, 2, 1{ Generic, Neve, API }> Model
+
+//------------------------------------------------------------
+// @init
+//------------------------------------------------------------
+@init
+tiny = 0.000000001;
+limit = 6;
+os_factor = 2;
+
+adaa_dx_min = 0.000000001;
+adaa_num_min = 0.000000000001;
+
+x_prevL = 0;
+x_prevR = 0;
+adaa_startedL = 0;
+adaa_startedR = 0;
+
+// track last model for ADAA reset
+adaa_model_prev = -1;
+
+butt_Q = 0.70710678;
+
+lp_b0 = 0; lp_b1 = 0; lp_b2 = 0; lp_a1 = 0; lp_a2 = 0;
+
+// biquad states for two cascaded lowpasses (LR4 low)
+lp1_z1L = 0; lp1_z2L = 0; lp2_z1L = 0; lp2_z2L = 0;
+lp1_z1R = 0; lp1_z2R = 0; lp2_z1R = 0; lp2_z2R = 0;
+
+// FIR coeffs (your Kaiser window)
+fir0 = 0.0000137; fir1 = 0.0000992; fir2 = -0.0001761; fir3 = -0.0008999;
+fir4 = 0.0003102; fir5 = 0.0037478; fir6 = 0.0010267; fir7 = -0.0103105;
+fir8 = -0.0077745; fir9 = 0.0211793; fir10 = 0.0277358; fir11 = -0.0344151;
+fir12 = -0.0796567; fir13 = 0.0455955; fir14 = 0.3085197; fir15 = 0.4500098;
+fir16 = 0.3085197; fir17 = 0.0455955; fir18 = -0.0796567; fir19 = -0.0344151;
+fir20 = 0.0277358; fir21 = 0.0211793; fir22 = -0.0077745; fir23 = -0.0103105;
+fir24 = 0.0010267; fir25 = 0.0037478; fir26 = 0.0003102; fir27 = -0.0008999;
+fir28 = -0.0001761; fir29 = 0.0000992; fir30 = 0.0000137;
+
+// Delay lines (unchanged)
+upL0..upL30 = upR0..upR30 = downL0..downL30 = downR0..downR30 = 0;
+
+// tanh / cosh helpers
+function my_tanh(t) local(e2x, num, den)(
+  e2x = exp(2 * t);
+num = e2x - 1;
+den = e2x + 1;
+den == 0 ? 0 : num / den;
+);
+function my_cosh(t) local(ex, enx)(
+  ex = exp(t);
+enx = exp(-t);
+(ex + enx) * 0.5;
+);
+
+// Waveshaper
+// Waveshaper
+// Waveshaper
+function ws_color_d() (1 + 9 * color);
+
+// --- base tanh helpers (original curve, but NO internal clamp) ---
+function ws_f_generic(x) local(d, t)(
+  d = ws_color_d();
+t = d * x;
+my_tanh(t);
+);
+
+function ws_F_generic(x) local(d, t, c)(
+  d = ws_color_d();
+t = d * x;
+c = my_cosh(t);
+c <= 0 ? 0 : log(c) / d;
+);
+
+// --- "Neve-ish": softer, extra odd harmonics ---
+// y = a*tanh(d x) + b*tanh(3 d x)
+function ws_f_neve(x) local(d, t1, t3, a, b)(
+  d = ws_color_d();
+a = 0.85;
+b = 0.15;
+t1 = d * x;
+t3 = 3 * d * x;
+a * my_tanh(t1) + b * my_tanh(t3);
+);
+
+function ws_F_neve(x) local(d, t1, t3, a, b, F1, F3)(
+  d = ws_color_d();
+a = 0.85;
+b = 0.15;
+t1 = d * x;
+t3 = 3 * d * x;
+
+F1 = my_cosh(t1); F1 <= 0 ? F1 = 0 : F1 = log(F1) / d;
+F3 = my_cosh(t3); F3 <= 0 ? F3 = 0 : F3 = log(F3) / (3 * d);
+
+a * F1 + b * F3;
+);
+
+// --- "API-ish": punchier, more linear core ---
+// y = a*x + b*tanh(d x)
+function ws_f_api(x) local(d, t, a, b)(
+  d = ws_color_d();
+a = 0.3;
+b = 0.7;
+t = d * x;
+a * x + b * my_tanh(t);
+);
+
+function ws_F_api(x) local(d, t, a, b, c, Ft)(
+  d = ws_color_d();
+a = 0.3;
+b = 0.7;
+t = d * x;
+c = my_cosh(t);
+c <= 0 ? Ft = 0 : Ft = log(c) / d;  // ∫tanh(d x) dx
+0.5 * a * x * x + b * Ft;                   // ∫(a x + b tanh(d x)) dx
+);
+
+// --- dispatcher used by ADAA ---
+// slider5:0<0,2,1{Generic,Neve,API}>Model
+function ws_f(x) (
+  slider5 == 0 ? ws_f_generic(x) :
+    slider5 == 1 ? ws_f_neve(x) :
+      ws_f_api(x);
+);
+
+function ws_F(x) (
+  slider5 == 0 ? ws_F_generic(x) :
+    slider5 == 1 ? ws_F_neve(x) :
+      ws_F_api(x);
+);
+
+
+// FIR up/down (your original – unchanged)
+function fir_up_L(x) local(y)(
+  upL30 = upL29; upL29 = upL28; upL28 = upL27; upL27 = upL26; upL26 = upL25;
+upL25 = upL24; upL24 = upL23; upL23 = upL22; upL22 = upL21; upL21 = upL20;
+upL20 = upL19; upL19 = upL18; upL18 = upL17; upL17 = upL16; upL16 = upL15;
+upL15 = upL14; upL14 = upL13; upL13 = upL12; upL12 = upL11; upL11 = upL10;
+upL10 = upL9; upL9 = upL8; upL8 = upL7; upL7 = upL6; upL6 = upL5;
+upL5 = upL4; upL4 = upL3; upL3 = upL2; upL2 = upL1; upL1 = upL0; upL0 = x;
+y = fir0 * upL0 + fir1 * upL1 + fir2 * upL2 + fir3 * upL3 + fir4 * upL4 + fir5 * upL5 + fir6 * upL6 + fir7 * upL7 + fir8 * upL8 + fir9 * upL9 +
+  fir10 * upL10 + fir11 * upL11 + fir12 * upL12 + fir13 * upL13 + fir14 * upL14 + fir15 * upL15 + fir16 * upL16 + fir17 * upL17 + fir18 * upL18 + fir19 * upL19 +
+  fir20 * upL20 + fir21 * upL21 + fir22 * upL22 + fir23 * upL23 + fir24 * upL24 + fir25 * upL25 + fir26 * upL26 + fir27 * upL27 + fir28 * upL28 + fir29 * upL29 + fir30 * upL30;
+y;
+);
+function fir_up_R(x) local(y)(
+  upR30 = upR29; upR29 = upR28; upR28 = upR27; upR27 = upR26; upR26 = upR25;
+upR25 = upR24; upR24 = upR23; upR23 = upR22; upR22 = upR21; upR21 = upR20;
+upR20 = upR19; upR19 = upR18; upR18 = upR17; upR17 = upR16; upR16 = upR15;
+upR15 = upR14; upR14 = upR13; upR13 = upR12; upR12 = upR11; upR11 = upR10;
+upR10 = upR9; upR9 = upR8; upR8 = upR7; upR7 = upR6; upR6 = upR5;
+upR5 = upR4; upR4 = upR3; upR3 = upR2; upR2 = upR1; upR1 = upR0; upR0 = x;
+y = fir0 * upR0 + fir1 * upR1 + fir2 * upR2 + fir3 * upR3 + fir4 * upR4 + fir5 * upR5 + fir6 * upR6 + fir7 * upR7 + fir8 * upR8 + fir9 * upR9 +
+  fir10 * upR10 + fir11 * upR11 + fir12 * upR12 + fir13 * upR13 + fir14 * upR14 + fir15 * upR15 + fir16 * upR16 + fir17 * upR17 + fir18 * upR18 + fir19 * upR19 +
+  fir20 * upR20 + fir21 * upR21 + fir22 * upR22 + fir23 * upR23 + fir24 * upR24 + fir25 * upR25 + fir26 * upR26 + fir27 * upR27 + fir28 * upR28 + fir29 * upR29 + fir30 * upR30;
+y;
+);
+function fir_down_L(x) local(y)(
+  downL30 = downL29; downL29 = downL28; downL28 = downL27; downL27 = downL26; downL26 = downL25;
+downL25 = downL24; downL24 = downL23; downL23 = downL22; downL22 = downL21; downL21 = downL20;
+downL20 = downL19; downL19 = downL18; downL18 = downL17; downL17 = downL16; downL16 = downL15;
+downL15 = downL14; downL14 = downL13; downL13 = downL12; downL12 = downL11; downL11 = downL10;
+downL10 = downL9; downL9 = downL8; downL8 = downL7; downL7 = downL6; downL6 = downL5;
+downL5 = downL4; downL4 = downL3; downL3 = downL2; downL2 = downL1; downL1 = downL0; downL0 = x;
+y = fir0 * downL0 + fir1 * downL1 + fir2 * downL2 + fir3 * downL3 + fir4 * downL4 + fir5 * downL5 + fir6 * downL6 + fir7 * downL7 + fir8 * downL8 + fir9 * downL9 +
+  fir10 * downL10 + fir11 * downL11 + fir12 * downL12 + fir13 * downL13 + fir14 * downL14 + fir15 * downL15 + fir16 * downL16 + fir17 * downL17 + fir18 * downL18 + fir19 * downL19 +
+  fir20 * downL20 + fir21 * downL21 + fir22 * downL22 + fir23 * downL23 + fir24 * downL24 + fir25 * downL25 + fir26 * downL26 + fir27 * downL27 + fir28 * downL28 + fir29 * downL29 + fir30 * downL30;
+y;
+);
+function fir_down_R(x) local(y)(
+  downR30 = downR29; downR29 = downR28; downR28 = downR27; downR27 = downR26; downR26 = downR25;
+downR25 = downR24; downR24 = downR23; downR23 = downR22; downR22 = downR21; downR21 = downR20;
+downR20 = downR19; downR19 = downR18; downR18 = downR17; downR17 = downR16; downR16 = downR15;
+downR15 = downR14; downR14 = downR13; downR13 = downR12; downR12 = downR11; downR11 = downR10;
+downR10 = downR9; downR9 = downR8; downR8 = downR7; downR7 = downR6; downR6 = downR5;
+downR5 = downR4; downR4 = downR3; downR3 = downR2; downR2 = downR1; downR1 = downR0; downR0 = x;
+y = fir0 * downR0 + fir1 * downR1 + fir2 * downR2 + fir3 * downR3 + fir4 * downR4 + fir5 * downR5 + fir6 * downR6 + fir7 * downR7 + fir8 * downR8 + fir9 * downR9 +
+  fir10 * downR10 + fir11 * downR11 + fir12 * downR12 + fir13 * downR13 + fir14 * downR14 + fir15 * downR15 + fir16 * downR16 + fir17 * downR17 + fir18 * downR18 + fir19 * downR19 +
+  fir20 * downR20 + fir21 * downR21 + fir22 * downR22 + fir23 * downR23 + fir24 * downR24 + fir25 * downR25 + fir26 * downR26 + fir27 * downR27 + fir28 * downR28 + fir29 * downR29 + fir30 * downR30;
+y;
+);
+
+@slider
+ingain = 10 ^ (slider1 / 20);
+outgain = 10 ^ (slider3 / 20);
+color = slider2;
+
+// === AUTO MAKEUP FOR LOW-BAND BOOST ===
+drive_amt = 1 + 9 * color;                     // 1 → 10×
+low_makeup = 1 / sqrt(drive_amt);            // perfect perceived loudness compensation
+// (sqrt because tanh is a compressive curve – this keeps the low band at ~same loudness)
+
+fs_os = srate * os_factor;
+ingain = 10 ^ (slider1 / 20);
+outgain = 10 ^ (slider3 / 20);
+color = slider2;
+
+model = slider5 | 0; // 0=Generic,1=Neve,2=API
+model != adaa_model_prev ? (
+  adaa_startedL = 0;
+adaa_startedR = 0;
+x_prevL = 0;
+x_prevR = 0;
+adaa_model_prev = model;
+);
+
+fs_os = srate * os_factor;
+lp_cutoff = slider4;
+lp_cutoff < 20 ? lp_cutoff = 20;
+lp_cutoff > fs_os * 0.45 ? lp_cutoff = fs_os * 0.45;
+
+omega = 2 * $pi * lp_cutoff / fs_os;
+sn = sin(omega);
+cs = cos(omega);
+alpha = sn / (2 * butt_Q);
+a0 = 1 + alpha;
+inv_a0 = 1 / a0;
+
+lp_b0 = ((1 - cs) * 0.5) * inv_a0;
+lp_b1 = (1 - cs) * inv_a0;
+lp_b2 = ((1 - cs) * 0.5) * inv_a0;
+lp_a1 = (-2 * cs) * inv_a0;
+lp_a2 = (1 - alpha) * inv_a0;
+
+@sample
+inL_host = spl0 * ingain;
+inR_host = spl1 * ingain;
+
+abs(inL_host) < tiny ? inL_host = 0;
+abs(inR_host) < tiny ? inR_host = 0;
+
+outL_host = 0;
+outR_host = 0;
+os_i = 0;
+
+loop(os_factor,
+  os_inL = os_i == 0 ? inL_host : 0;
+os_inR = os_i == 0 ? inR_host : 0;
+
+osL = fir_up_L(os_inL);
+osR = fir_up_R(os_inR);
+
+// === CORRECT LR4 SPLIT USING ONLY LOWPASS BIQUADS ===
+// Stage 1 lowpass
+lp1L = lp_b0 * osL + lp_b1 * lp1_z1L + lp_b2 * lp1_z2L - lp_a1 * lp1_z1L - lp_a2 * lp1_z2L;
+lp1_z2L = lp1_z1L; lp1_z1L = lp1L;
+lp1R = lp_b0 * osR + lp_b1 * lp1_z1R + lp_b2 * lp1_z2R - lp_a1 * lp1_z1R - lp_a2 * lp1_z2R;
+lp1_z2R = lp1_z1R; lp1_z1R = lp1R;
+
+// Stage 2 lowpass → true LR4 low band
+lowL = lp_b0 * lp1L + lp_b1 * lp2_z1L + lp_b2 * lp2_z2L - lp_a1 * lp2_z1L - lp_a2 * lp2_z2L;
+lp2_z2L = lp2_z1L; lp2_z1L = lowL;
+lowR = lp_b0 * lp1R + lp_b1 * lp2_z1R + lp_b2 * lp2_z2R - lp_a1 * lp2_z1R - lp_a2 * lp2_z2R;
+lp2_z2R = lp2_z1R; lp2_z1R = lowR;
+
+// High band = original - low band → perfect reconstruction
+highL = osL - lowL;
+highR = osR - lowR;
+
+// === BYPASS ADAA WHEN COLOR = 0 (perfect flat) ===
+color == 0 ? (
+  y_satL = lowL;
+y_satR = lowR;
+  ) : (
+  // Your original ADAA block – unchanged
+  xL = lowL;
+adaa_startedL == 0 ? (
+  y_satL = ws_f(xL);
+x_prevL = xL;
+adaa_startedL = 1;
+    ) : (
+  abs(xL) < tiny && abs(x_prevL) < tiny ? (
+    y_satL = 0;
+      ) : (
+  dxL = xL - x_prevL;
+F_xL = ws_F(xL);
+F_pL = ws_F(x_prevL);
+numL = F_xL - F_pL;
+denL = dxL;
+(abs(denL) < adaa_dx_min || abs(numL) < adaa_num_min) ? (
+  y_satL = ws_f(0.5 * (xL + x_prevL));
+        ) : (
+  y_satL = numL / denL;
+        );
+      );
+x_prevL = xL;
+    );
+
+xR = lowR;
+adaa_startedR == 0 ? (
+  y_satR = ws_f(xR);
+x_prevR = xR;
+adaa_startedR = 1;
+    ) : (
+  abs(xR) < tiny && abs(x_prevR) < tiny ? (
+    y_satR = 0;
+      ) : (
+  dxR = xR - x_prevR;
+F_xR = ws_F(xR);
+F_pR = ws_F(x_prevR);
+numR = F_xR - F_pR;
+denR = dxR;
+(abs(denR) < adaa_dx_min || abs(numR) < adaa_num_min) ? (
+  y_satR = ws_f(0.5 * (xR + x_prevR));
+        ) : (
+  y_satR = numR / denR;
+        );
+      );
+x_prevR = xR;
+    );
+
+y_satL > 4 ? y_satL = 4 : y_satL < -4 ? y_satL = -4;
+y_satR > 4 ? y_satR = 4 : y_satR < -4 ? y_satR = -4;
+  );
+
+// recombine: saturated lows + clean highs
+os_outL = y_satL * low_makeup + highL;
+os_outR = y_satR * low_makeup + highR;
+
+dsL = fir_down_L(os_outL);
+dsR = fir_down_R(os_outR);
+
+os_i == os_factor - 1 ? (
+  outL_host = dsL;
+outR_host = dsR;
+  );
+
+os_i += 1;
+);
+
+spl0 = outL_host * outgain;
+spl1 = outR_host * outgain;

@@ -1,0 +1,320 @@
+desc:Exile Stereo Delay LA
+// ------------------------------------------------------------
+// Exile Studio – JSFX Collection
+// Name   : Exile Stereo Delay LA
+// Version: 1.0
+// Author : Michele Raggi
+// Repo   : https://github.com/exile-studio/JSFX-Collection
+//
+// License: Creative Commons Attribution 4.0 International (CC BY 4.0)
+//          You are free to use, modify, and redistribute this file,
+//          including in commercial projects, as long as you provide
+//          appropriate credit to "exile_studio" and indicate if changes
+//          were made.
+//
+// Additional notes:
+//   All references to existing brands, products, hardware models,
+//   or company names are used purely for descriptive and comparative
+//   purposes. They are not endorsements, not affiliations, and 
+//   definitely not official models.
+//   And yes - they’re written in clear text because, honestly,
+//   who the fuck cares.
+//
+// Full license text:
+//   https://creativecommons.org/licenses/by/4.0/
+//
+// Support / warranty:
+//   None. Use at your own risk.
+// ------------------------------------------------------------
+
+//----------------------------------------------------
+// Sliders
+//----------------------------------------------------
+// 0 = Free (ms), 1 = Sync (host tempo)
+slider1: 1 < 0, 1, 1{ Free, Sync }> Time Mode
+// Free delay time (ms)
+slider2: 250 < 1, 2000, 1 > Delay Time(ms)
+// Sync division
+slider3: 1 < 0, 8, 1{ 1 / 4, 1 / 8, 1 / 16, 1 / 2, 1 / 1, 1 / 4 dot, 1 / 8 dot, 1 / 4 tri, 1 / 8 tri }> Sync Division
+// Offset ±10 ms
+slider4: 0 < -10, 10, 0.1 > Stereo Offset(ms)
+// Feedback
+slider5: 0.35 < 0, 0.95, 0.01 > Feedback
+// Mix: default = 0 (all dry)
+slider6: 0 < 0, 1, 0.01 > Mix
+// HPF
+slider7: 80 < 20, 1000, 1 > HPF(Hz)
+// LPF
+slider8: 8000 < 1000, 20000, 10 > LPF(Hz)
+// Saturation default OFF
+slider9: 0 < 0, 1, 1{ Off, On }> Saturation
+// Saturation drive
+slider10: 6 < -12, 24, 0.5 > Sat Drive(dB)
+
+
+//----------------------------------------------------
+// Internals
+//----------------------------------------------------
+@init
+
+// Fixed delay buffer (~10.9 s at 48k)
+buf_len = 524288;
+max_delay_samps = buf_len - 1;
+pos = 0;
+
+// allocate buffers
+delayL[524288];
+delayR[524288];
+
+// filter states
+hp_state_L = 0;
+hp_state_R = 0;
+lp_state_L = 0;
+lp_state_R = 0;
+
+alpha_hp = 0;
+alpha_lp = 0;
+
+// delay times in samples
+delay_samps_L = 1;
+delay_samps_R = 1;
+
+// ADAA saturation state
+last_sat_in_L = 0;
+last_sat_in_R = 0;
+g_sat = 1.5;     // curvature: 1.2–2.0 ~ tube-ish
+
+// sat gains
+sat_on = 0;
+sat_pre_gain = 1;
+sat_post_gain = 1;
+
+small = 0.000000001;
+
+//----------------------------------------------------
+// Helpers
+//----------------------------------------------------
+
+// tanh approximation using exp()
+// tanh(z) = (e^z - e^-z) / (e^z + e^-z)
+function tanh_approx(z)
+(
+  z > 10 ? z = 10;
+z < -10 ? z = -10;
+
+ez = exp(z);
+emz = 1 / ez;
+num = ez - emz;
+den = ez + emz;
+den == 0 ? 0 : (num / den);
+);
+
+// antiderivative for tanh(gx): F(x) = ln(cosh(gx))/g
+function F_tanh(x)
+(
+  gx = g_sat * x;
+gx > 10 ? gx = 10;
+gx < -10 ? gx = -10;
+
+epos = exp(gx);
+eneg = 1 / epos;
+cosh_gx = 0.5 * (epos + eneg);
+log(cosh_gx) / g_sat;
+);
+
+// ADAA tanh saturator – approximates tanh(g*x)
+function sat_tanh_adaa(x, lastx)
+(
+  dx = x - lastx;
+abs(dx) < small ?
+  (
+    // fallback to plain tanh when delta is tiny
+    tanh_approx(g_sat * x);
+    ) :
+(
+  (F_tanh(x) - F_tanh(lastx)) / dx;
+    );
+);
+
+//----------------------------------------------------
+@block
+
+time_mode = slider1 | 0;
+delay_ms = slider2;
+division = slider3 | 0;
+offset_ms = slider4;
+feedback = slider5;
+mix = slider6;
+hpf_freq = slider7;
+lpf_freq = slider8;
+
+sat_on = slider9 | 0;
+sat_drive_db = slider10;
+
+feedback < 0 ? feedback = 0;
+feedback > 0.95 ? feedback = 0.95;
+
+// sat gains
+sat_pre_gain = pow(10, sat_drive_db / 20);
+sat_pre_gain <= 0 ? sat_pre_gain = 1;
+sat_post_gain = 1 / sat_pre_gain;
+
+//------------------------
+// compute base delay time (ms)
+//------------------------
+base_ms = delay_ms;
+
+time_mode == 1 ? (
+  bpm = tempo;
+bpm <= 0 ? bpm = 120;
+
+quarter_sec = 60 / bpm;
+dur_sec = quarter_sec;
+
+division == 0 ? dur_sec = quarter_sec;                 // 1/4
+division == 1 ? dur_sec = quarter_sec * 0.5;           // 1/8
+division == 2 ? dur_sec = quarter_sec * 0.25;          // 1/16
+division == 3 ? dur_sec = quarter_sec * 2;             // 1/2
+division == 4 ? dur_sec = quarter_sec * 4;             // 1/1
+division == 5 ? dur_sec = quarter_sec * 1.5;           // 1/4 dotted
+division == 6 ? dur_sec = quarter_sec * 0.5 * 1.5;     // 1/8 dotted
+division == 7 ? dur_sec = quarter_sec * (2 / 3);         // 1/4 triplet
+division == 8 ? dur_sec = quarter_sec * 0.5 * (2 / 3);   // 1/8 triplet
+
+base_ms = dur_sec * 1000;
+);
+
+// max delay in ms from buffer + SR
+max_delay_sec = max_delay_samps / srate;
+max_ms = max_delay_sec * 1000;
+
+// clamp offset to ±10 ms
+offset_ms > 10 ? offset_ms = 10;
+offset_ms < -10 ? offset_ms = -10;
+
+// Lord Alge offset:
+// L = base - offset, R = base + offset
+baseL_ms = base_ms - offset_ms;
+baseR_ms = base_ms + offset_ms;
+
+baseL_ms < 0 ? baseL_ms = 0;
+baseR_ms < 0 ? baseR_ms = 0;
+baseL_ms > max_ms ? baseL_ms = max_ms;
+baseR_ms > max_ms ? baseR_ms = max_ms;
+
+// convert to samples
+delay_samps_L = floor(baseL_ms * srate / 1000);
+delay_samps_R = floor(baseR_ms * srate / 1000);
+
+delay_samps_L < 0 ? delay_samps_L = 0;
+delay_samps_R < 0 ? delay_samps_R = 0;
+delay_samps_L > max_delay_samps ? delay_samps_L = max_delay_samps;
+delay_samps_R > max_delay_samps ? delay_samps_R = max_delay_samps;
+
+//------------------------
+// filters (1st-order HP + LP for repeats)
+//------------------------
+hpf_freq < 20 ? hpf_freq = 20;
+lpf_freq > (srate * 0.45) ? lpf_freq = srate * 0.45;
+
+alpha_hp = 1 - exp(-2 * $pi * hpf_freq / srate);
+alpha_lp = 1 - exp(-2 * $pi * lpf_freq / srate);
+
+alpha_hp < 0 ? alpha_hp = 0;
+alpha_hp > 1 ? alpha_hp = 1;
+alpha_lp < 0 ? alpha_lp = 0;
+alpha_lp > 1 ? alpha_lp = 1;
+
+//----------------------------------------------------
+@sample
+
+inL = spl0;
+inR = spl1;
+
+// advance write position
+pos += 1;
+pos >= buf_len ? pos = 0;
+
+// read positions for L/R
+readL = pos - delay_samps_L;
+readR = pos - delay_samps_R;
+readL < 0 ? readL += buf_len;
+readR < 0 ? readR += buf_len;
+
+// read delayed samples
+rawL = delayL[readL];
+rawR = delayR[readR];
+
+//------------------------------
+// FILTER delayed signal (HP then LP)
+// affects BOTH wet and feedback
+//------------------------------
+
+// LEFT
+xL = rawL;
+hp_state_L += alpha_hp * (xL - hp_state_L);
+hpL = xL - hp_state_L;
+lp_state_L += alpha_lp * (hpL - lp_state_L);
+filtL = lp_state_L;
+
+// RIGHT
+xR = rawR;
+hp_state_R += alpha_hp * (xR - hp_state_R);
+hpR = xR - hp_state_R;
+lp_state_R += alpha_lp * (hpR - lp_state_R);
+filtR = lp_state_R;
+
+//------------------------------
+// ADAA saturation on filtered delay
+// used for BOTH wet and feedback
+//------------------------------
+satL = filtL;
+satR = filtR;
+
+sat_on ? (
+  // LEFT
+  in_sat_L = satL * sat_pre_gain;
+out_sat_L = sat_tanh_adaa(in_sat_L, last_sat_in_L);
+last_sat_in_L = in_sat_L;
+satL = out_sat_L * sat_post_gain;
+
+// RIGHT
+in_sat_R = satR * sat_pre_gain;
+out_sat_R = sat_tanh_adaa(in_sat_R, last_sat_in_R);
+last_sat_in_R = in_sat_R;
+satR = out_sat_R * sat_post_gain;
+);
+
+// feedback from saturated delays
+fbL = satL;
+fbR = satR;
+
+//------------------------------
+// Write into delay buffers
+//------------------------------
+delayL[pos] = inL + fbL * feedback;
+delayR[pos] = inR + fbR * feedback;
+
+// wet = saturated + filtered delayed taps
+wetL = satL;
+wetR = satR;
+
+//------------------------------
+// Equal-power dry/wet mix
+//------------------------------
+mix <= 0 ? (
+  spl0 = inL;
+spl1 = inR;
+) :
+mix >= 1 ? (
+  spl0 = wetL;
+spl1 = wetR;
+) :
+(
+  t = mix;
+dry_gain = sqrt(1 - t);
+wet_gain = sqrt(t);
+spl0 = inL * dry_gain + wetL * wet_gain;
+spl1 = inR * dry_gain + wetR * wet_gain;
+);
+

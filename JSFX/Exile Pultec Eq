@@ -1,0 +1,332 @@
+desc:Exile Pultec Eq
+
+// ------------------------------------------------------------
+// Exile Studio – JSFX Collection
+// Name   : Exile Pultec Eq
+// Version: 1.0
+// Author : Michele Raggi
+// Repo   : https://github.com/exile-studio/JSFX-Collection
+//
+// License: Creative Commons Attribution 4.0 International (CC BY 4.0)
+//          You are free to use, modify, and redistribute this file,
+//          including in commercial projects, as long as you provide
+//          appropriate credit to "exile_studio" and indicate if changes
+//          were made.
+//
+// Additional notes:
+//   All references to existing brands, products, hardware models,
+//   or company names are used purely for descriptive and comparative
+//   purposes. They are not endorsements, not affiliations, and 
+//   definitely not official models.
+//   And yes - they’re written in clear text because, honestly,
+//   who the fuck cares.
+//
+// Full license text:
+//   https://creativecommons.org/licenses/by/4.0/
+//
+// Support / warranty:
+//   None. Use at your own risk.
+// ------------------------------------------------------------
+
+
+//----------------------------------------------------
+// Sliders
+//----------------------------------------------------
+slider1:0<-12,12,0.1>Low Boost (dB)
+slider2:0<0,12,0.1>Low Atten (dB)
+slider3:1<0,2,1{60 Hz,100 Hz,200 Hz}>Low F
+
+slider4:0<-12,12,0.1>High Boost (dB)
+slider5:0<0,12,0.1>High Atten (dB)
+slider6:2<0,5,1{3 kHz,4 kHz,5 kHz,8 kHz,10 kHz,12 kHz}>High Boost F
+slider9:1<0,2,1{5 kHz,10 kHz,20 kHz}>High Atten F
+
+slider7:0<-24,24,0.1>Output Trim (dB)
+slider8:0<0,12,0.1>Sat Amount (dB)
+
+//----------------------------------------------------
+// @init
+//----------------------------------------------------
+@init
+twoPi = 2*$pi;
+
+// low shelf boost biquad
+ls_b0 = 1; ls_b1 = 0; ls_b2 = 0; ls_a1 = 0; ls_a2 = 0;
+ls_z1L = 0; ls_z2L = 0; ls_z1R = 0; ls_z2R = 0;
+
+// low bell cut biquad
+lb_b0 = 1; lb_b1 = 0; lb_b2 = 0; lb_a1 = 0; lb_a2 = 0;
+lb_z1L = 0; lb_z2L = 0; lb_z1R = 0; lb_z2R = 0;
+
+// high bell boost biquad
+hb_b0 = 1; hb_b1 = 0; hb_b2 = 0; hb_a1 = 0; hb_a2 = 0;
+hb_z1L = 0; hb_z2L = 0; hb_z1R = 0; hb_z2R = 0;
+
+// high shelf cut biquad
+hs_b0 = 1; hs_b1 = 0; hs_b2 = 0; hs_a1 = 0; hs_a2 = 0;
+hs_z1L = 0; hs_z2L = 0; hs_z1R = 0; hs_z2R = 0;
+
+// fixed Qs
+lowCut_Q    = 0.30;
+highBoost_Q = 0.55;
+
+// saturation state
+sat_enabled = 0;
+sat_drive   = 1;
+sat_idrive  = 1;
+sat_limit   = 1.5;      // clamp before shaping
+adaa_x_prevL = 0;
+adaa_x_prevR = 0;
+
+//----------------------------------------------------
+// ADAA cubic soft clip
+// f(x)  = x - x^3/3
+// F(x)  = x^2/2 - x^4/12
+// y[n] ≈ (F(x[n]) - F(x[n-1])) / (x[n] - x[n-1])
+//----------------------------------------------------
+function adaa_cubic(x, x_prev)
+(
+  du = x - x_prev;
+  abs(du) > 0.0000000001 ?
+  (
+    // F(x)   = x^2/2 - x^4/12
+    F     = x*x*0.5 - x*x*x*x*(1/12);
+    Fprev = x_prev*x_prev*0.5 - x_prev*x_prev*x_prev*x_prev*(1/12);
+    (F - Fprev) / du;
+  ) :
+  (
+    // small-step fallback ≈ f(midpoint)
+    xm  = 0.5 * (x + x_prev);
+    xm - (xm*xm*xm)/3;
+  );
+);
+
+//----------------------------------------------------
+// @slider – compute coefficients
+//----------------------------------------------------
+@slider
+
+fs      = srate;
+outgain = 10^(slider7/20);
+
+// ---------- Saturation drive ----------
+low_boost  = max(0, slider1);
+high_boost = max(0, slider4);
+low_energy  = low_boost  * 0.10;
+high_energy = high_boost * 0.04;
+total_push  = low_energy + high_energy;
+
+sat_drive_dB = slider8 + total_push * 3.0;
+sat_drive_dB < 0 ? sat_drive_dB = 0;
+sat_drive_dB = min(sat_drive_dB, 8.0);
+
+sat_enabled = (sat_drive_dB > 0.0001);
+sat_drive   = 10^(sat_drive_dB/20);
+sat_idrive  = 1/sat_drive;
+
+// ---------- LOW BAND ----------
+
+// choose low frequency
+low_idx = slider3|0;
+lowF = low_idx == 0 ? 60 : low_idx == 1 ? 100 : 200;
+
+// LOW SHELF BOOST
+gL_boost = slider1;
+gL_boost == 0 ? (
+  ls_b0 = 1; ls_b1 = 0; ls_b2 = 0; ls_a1 = 0; ls_a2 = 0;
+) : (
+  A     = 10^(gL_boost/40);
+  w0    = twoPi*lowF/fs;
+  cs    = cos(w0);
+  sn    = sin(w0);
+  S     = 1;
+  alpha = sn/2 * sqrt((A + 1/A)*(1/S - 1) + 2);
+  sqrtA = sqrt(A);
+
+  b0 =    A*((A+1) - (A-1)*cs + 2*sqrtA*alpha);
+  b1 =  2*A*((A-1) - (A+1)*cs);
+  b2 =    A*((A+1) - (A-1)*cs - 2*sqrtA*alpha);
+  a0 =       (A+1) + (A-1)*cs + 2*sqrtA*alpha;
+  a1 =   -2*((A-1) + (A+1)*cs);
+  a2 =       (A+1) + (A-1)*cs - 2*sqrtA*alpha;
+
+  inv_a0 = 1/a0;
+  ls_b0 = b0*inv_a0;
+  ls_b1 = b1*inv_a0;
+  ls_b2 = b2*inv_a0;
+  ls_a1 = a1*inv_a0;
+  ls_a2 = a2*inv_a0;
+);
+
+// LOW BELL ATTENUATION (cut)
+gL_cut = -abs(slider2);
+gL_cut == 0 ? (
+  lb_b0 = 1; lb_b1 = 0; lb_b2 = 0; lb_a1 = 0; lb_a2 = 0;
+) : (
+  A     = 10^(gL_cut/40);
+  w0    = twoPi*lowF/fs;
+  cs    = cos(w0);
+  sn    = sin(w0);
+  alpha = sn/(2*lowCut_Q);
+
+  b0 =   1 + alpha*A;
+  b1 =  -2*cs;
+  b2 =   1 - alpha*A;
+  a0 =   1 + alpha/A;
+  a1 =  -2*cs;
+  a2 =   1 - alpha/A;
+
+  inv_a0 = 1/a0;
+  lb_b0 = b0*inv_a0;
+  lb_b1 = b1*inv_a0;
+  lb_b2 = b2*inv_a0;
+  lb_a1 = a1*inv_a0;
+  lb_a2 = a2*inv_a0;
+);
+
+// ---------- HIGH BAND ----------
+
+// choose high boost frequency (EQP-1A: 3,4,5,8,10,12 kHz)
+hi_idx = slider6|0;
+hiF_boost =
+  hi_idx == 0 ? 3000 :
+  hi_idx == 1 ? 4000 :
+  hi_idx == 2 ? 5000 :
+  hi_idx == 3 ? 8000 :
+  hi_idx == 4 ? 10000 : 12000;
+
+// HIGH BELL BOOST
+gH_boost = slider4;
+gH_boost == 0 ? (
+  hb_b0 = 1; hb_b1 = 0; hb_b2 = 0; hb_a1 = 0; hb_a2 = 0;
+) : (
+  A     = 10^(gH_boost/40);
+  w0    = twoPi*hiF_boost/fs;
+  cs    = cos(w0);
+  sn    = sin(w0);
+  alpha = sn/(2*highBoost_Q);
+
+  b0 =   1 + alpha*A;
+  b1 =  -2*cs;
+  b2 =   1 - alpha*A;
+  a0 =   1 + alpha/A;
+  a1 =  -2*cs;
+  a2 =   1 - alpha/A;
+
+  inv_a0 = 1/a0;
+  hb_b0 = b0*inv_a0;
+  hb_b1 = b1*inv_a0;
+  hb_b2 = b2*inv_a0;
+  hb_a1 = a1*inv_a0;
+  hb_a2 = a2*inv_a0;
+);
+
+// HIGH SHELF ATTENUATION (EQP-1A: 5,10,20 kHz)
+hs_idx = slider9|0;
+hiF_shelf =
+  hs_idx == 0 ? 5000 :
+  hs_idx == 1 ? 10000 : 20000;
+
+gH_cut = -abs(slider5);
+gH_cut == 0 ? (
+  hs_b0 = 1; hs_b1 = 0; hs_b2 = 0; hs_a1 = 0; hs_a2 = 0;
+) : (
+  A     = 10^(gH_cut/40);
+  w0    = twoPi*hiF_shelf/fs;
+  cs    = cos(w0);
+  sn    = sin(w0);
+  S     = 1;
+  alpha = sn/2 * sqrt((A + 1/A)*(1/S - 1) + 2);
+  sqrtA = sqrt(A);
+
+  b0 =    A*((A+1) + (A-1)*cs + 2*sqrtA*alpha);
+  b1 = -2*A*((A-1) + (A+1)*cs);
+  b2 =    A*((A+1) + (A-1)*cs - 2*sqrtA*alpha);
+  a0 =       (A+1) - (A-1)*cs + 2*sqrtA*alpha;
+  a1 =    2*((A-1) - (A+1)*cs);
+  a2 =       (A+1) - (A-1)*cs - 2*sqrtA*alpha;
+
+  inv_a0 = 1/a0;
+  hs_b0 = b0*inv_a0;
+  hs_b1 = b1*inv_a0;
+  hs_b2 = b2*inv_a0;
+  hs_a1 = a1*inv_a0;
+  hs_a2 = a2*inv_a0;
+);
+
+//----------------------------------------------------
+// @sample – process audio
+//----------------------------------------------------
+@sample
+inL = spl0;
+inR = spl1;
+
+// LOW SHELF BOOST
+xL = inL;
+yL = ls_b0*xL + ls_z1L;
+ls_z1L = ls_b1*xL - ls_a1*yL + ls_z2L;
+ls_z2L = ls_b2*xL - ls_a2*yL;
+xL = yL;
+
+xR = inR;
+yR = ls_b0*xR + ls_z1R;
+ls_z1R = ls_b1*xR - ls_a1*yR + ls_z2R;
+ls_z2R = ls_b2*xR - ls_a2*yR;
+xR = yR;
+
+// LOW BELL CUT
+yL = lb_b0*xL + lb_z1L;
+lb_z1L = lb_b1*xL - lb_a1*yL + lb_z2L;
+lb_z2L = lb_b2*xL - lb_a2*yL;
+xL = yL;
+
+yR = lb_b0*xR + lb_z1R;
+lb_z1R = lb_b1*xR - lb_a1*yR + lb_z2R;
+lb_z2R = lb_b2*xR - lb_a2*yR;
+xR = yR;
+
+// HIGH BELL BOOST
+yL = hb_b0*xL + hb_z1L;
+hb_z1L = hb_b1*xL - hb_a1*yL + hb_z2L;
+hb_z2L = hb_b2*xL - hb_a2*yL;
+xL = yL;
+
+yR = hb_b0*xR + hb_z1R;
+hb_z1R = hb_b1*xR - hb_a1*yR + hb_z2R;
+hb_z2R = hb_b2*xR - hb_a2*yR;
+xR = yR;
+
+// HIGH SHELF CUT
+yL = hs_b0*xL + hs_z1L;
+hs_z1L = hs_b1*xL - hs_a1*yL + hs_z2L;
+hs_z2L = hs_b2*xL - hs_a2*yL;
+xL = yL;
+
+yR = hs_b0*xR + hs_z1R;
+hs_z1R = hs_b1*xR - hs_a1*yR + hs_z2R;
+hs_z2R = hs_b2*xR - hs_a2*yR;
+xR = yR;
+
+// ---------- ADAA saturation (post-EQ, pre-output) ----------
+sat_enabled ? (
+  xinL = xL * sat_drive;
+  xinR = xR * sat_drive;
+
+  xinL >  1.5 ? xinL =  1.5;
+  xinL < -1.5 ? xinL = -1.5;
+  xinR >  1.5 ? xinR =  1.5;
+  xinR < -1.5 ? xinR = -1.5;
+
+  ySatL = adaa_cubic(xinL, adaa_x_prevL);
+  ySatR = adaa_cubic(xinR, adaa_x_prevR);
+  adaa_x_prevL = xinL;
+  adaa_x_prevR = xinR;
+
+  xL = ySatL * sat_idrive;
+  xR = ySatR * sat_idrive;
+);
+
+// OUTPUT
+spl0 = xL * outgain;
+spl1 = xR * outgain;
+

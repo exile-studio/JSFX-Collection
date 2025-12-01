@@ -1,0 +1,169 @@
+desc:Exile Auto Gain Staging
+
+// ------------------------------------------------------------
+// Exile Studio – JSFX Collection
+// Name   : Exile Auto Gain Staging
+// Version: 1.0
+// Author : Michele Raggi
+// Repo   : https://github.com/exile-studio/JSFX-Collection
+//
+// License: Creative Commons Attribution 4.0 International (CC BY 4.0)
+//          You are free to use, modify, and redistribute this file,
+//          including in commercial projects, as long as you provide
+//          appropriate credit to "exile_studio" and indicate if changes
+//          were made.
+//
+// Additional notes:
+//   All references to existing brands, products, hardware models,
+//   or company names are used purely for descriptive and comparative
+//   purposes. They are not endorsements, not affiliations, and 
+//   definitely not official models.
+//   And yes - they’re written in clear text because, honestly,
+//   who the fuck cares.
+//
+// Full license text:
+//   https://creativecommons.org/licenses/by/4.0/
+//
+// Support / warranty:
+//   None. Use at your own risk.
+// ------------------------------------------------------------
+
+//-----------------------------------------
+// Sliders
+//-----------------------------------------
+// 0 = Peak (dBFS), 1 = Analog (VU-ish, 0 VU = -18 dBFS)
+slider1: 0 < 0, 1, 1{ Peak, Analog }> Meter Type
+// Target: Peak -> dBFS, Analog -> VU units (0 = 0VU, -6 = -6VU, +6 = +6VU)
+slider2: -6 < -30, 6, 0.1 > Target Level
+// 0 = Bypass, 1 = Learn, 2 = Apply
+slider3: 0 < 0, 2, 1{ Bypass, Learn, Apply }> Mode
+// Display only: learned gain in dB
+slider4: 0 < -60, 60, 0.01 > Learned Gain(dB)
+
+//-----------------------------------------
+// Internals
+//-----------------------------------------
+@init
+
+// detector state
+env_analog = 0;           // analog VU envelope (linear)
+max_meas_db = -200;       // max measured level (dBFS or VU depending on mode)
+
+// gain state
+gain_db = 0;
+gain_lin = 1;
+gain_smooth = 1;
+
+last_mode = 0;
+
+// constants
+tau_analog = 0.3;         // 300 ms VU-ish ballistics
+ref_dbfs_0vu = -18;       // 0 VU calibration in dBFS
+min_valid_db = -80;       // ignore super-low noise when learning
+small_val = 0.000000000001; // to avoid log(0)
+
+// helper functions
+function lin_to_db(lin)
+(
+    lin < small_val ? -120 : (20 * log10(lin));
+);
+
+function db_to_lin(db)
+(
+    db <= -120 ? 0 : (pow(10, db / 20));
+);
+
+//-----------------------------------------
+@slider
+meter_type = slider1 | 0;
+target_val = slider2;
+mode = slider3 | 0;
+
+//-----------------------------------------
+@sample
+
+spl0_in = spl0;
+spl1_in = spl1;
+
+// mono-ish level for detection
+aL = abs(spl0_in);
+aR = abs(spl1_in);
+absM = 0.5 * (aL + aR);
+
+//-----------------------------------------
+// Measure current level (Peak or Analog)
+//-----------------------------------------
+
+// Peak: sample peak in dBFS
+peak_lin = absM;
+peak_lin < small_val ? peak_lin = small_val;
+peak_dbfs = lin_to_db(peak_lin);
+
+// Analog: 300 ms envelope on abs signal, then dBFS -> VU
+alpha = exp(-1 / (tau_analog * srate));
+env_analog = alpha * env_analog + (1 - alpha) * absM;
+env_analog < small_val ? env_analog = small_val;
+analog_dbfs = lin_to_db(env_analog);
+analog_vu = analog_dbfs - ref_dbfs_0vu; // 0VU at -18 dBFS
+
+meter_val = meter_type == 0 ? peak_dbfs : analog_vu;
+
+//-----------------------------------------
+// Mode change handling
+//-----------------------------------------
+mode != last_mode ?
+    (
+        // entering Learn: reset max
+        mode == 1 ? max_meas_db = -200;
+last_mode = mode;
+);
+
+//-----------------------------------------
+// Learn mode: track max and compute gain
+//-----------------------------------------
+mode == 1 ?
+    (
+        // only learn from meaningful levels
+        meter_val > min_valid_db && meter_val > max_meas_db ?
+            max_meas_db = meter_val;
+
+// if we have at least one valid measurement, update gain
+max_meas_db > -180 ?
+    (
+        gain_db = target_val - max_meas_db;
+    ) :
+(
+    gain_db = 0; // no valid data yet
+    );
+
+gain_lin = db_to_lin(gain_db);
+);
+
+//-----------------------------------------
+// Apply mode: keep last gain (do nothing here)
+//-----------------------------------------
+// mode == 2 -> use existing gain_db / gain_lin
+
+//-----------------------------------------
+// Bypass mode: unity gain
+//-----------------------------------------
+mode == 0 ?
+    (
+        gain_db = 0;
+gain_lin = 1;
+);
+
+//-----------------------------------------
+// Smooth gain a bit to avoid clicks
+//-----------------------------------------
+tau_g = 0.01; // 10 ms smoothing
+ag = exp(-1 / (tau_g * srate));
+gain_smooth = ag * gain_smooth + (1 - ag) * gain_lin;
+
+// Apply
+spl0 = spl0_in * gain_smooth;
+spl1 = spl1_in * gain_smooth;
+
+// Update display
+slider4 = gain_db;
+

@@ -1,0 +1,480 @@
+desc:Exile 1176 Compressor
+
+// ------------------------------------------------------------
+// Exile Studio – JSFX Collection
+// Name   : Exile 1176 Compressor
+// Version: 1.0
+// Author : Michele Raggi
+// Repo   : https://github.com/exile-studio/JSFX-Collection
+//
+// License: Creative Commons Attribution 4.0 International (CC BY 4.0)
+//          You are free to use, modify, and redistribute this file,
+//          including in commercial projects, as long as you provide
+//          appropriate credit to "exile_studio" and indicate if changes
+//          were made.
+//
+// Additional notes:
+//   All references to existing brands, products, hardware models,
+//   or company names are used purely for descriptive and comparative
+//   purposes. They are not endorsements, not affiliations, and 
+//   definitely not official models.
+//   And yes - they’re written in clear text because, honestly,
+//   who the fuck cares.
+//
+// Full license text:
+//   https://creativecommons.org/licenses/by/4.0/
+//
+// Support / warranty:
+//   None. Use at your own risk.
+// ------------------------------------------------------------
+
+//----------------------------------------------------
+// Sliders
+//----------------------------------------------------
+slider1: 0 < -24, 24, 0.1 > Input(dB)
+slider2: 0 < 0, 3, 1 > { 4: 1, 8: 1, 12: 1, 20: 1 } Ratio
+slider3: 4 < 1, 7, 1 > Attack(1 = Slow, 7 = Fast)
+slider4: 4 < 1, 7, 1 > Release(1 = Slow, 7 = Fast)
+slider5: 0.4 < 0, 1, 0.01 > Color(0 = clean LN, 1 = dirty Rev A)
+slider6: 0 < -24, 24, 0.1 > Output(dB)
+slider7: -24 < -36, -6, 0.1 > Ref Level(dB)
+slider8: 0 < -40, 0, 0.1 > Gain Reduction(dB)
+
+//----------------------------------------------------
+// @init
+//----------------------------------------------------
+@init
+tiny = 0.000000000000000001;
+
+envL = 0; envR = 0;
+
+adaa_dx_min = 0.000000000001;
+adaa_num_min = 0.000000000000000001;
+
+// Audio path ADAA
+x_prevL = 0; x_prevR = 0;
+adaa_startedL = 0; adaa_startedR = 0;
+
+// Detector path ADAA
+x_prev_detL = 0; x_prev_detR = 0;
+adaa_started_detL = 0; adaa_started_detR = 0;
+
+fet_drive_prevL = 0; fet_drive_prevR = 0;
+
+LOG10_TO_DB = 20 / log(10);
+
+// For program-dependent release
+GR_dB_L_prev = 0;
+GR_dB_R_prev = 0;
+
+// Blackface-ish tilt filter state
+tilt_lf_L = 0; tilt_lf_R = 0;
+
+// Attack/Release tables
+function get_attack_ms(pos) (
+  pos == 1 ? 0.80 :
+    pos == 2 ? 0.40 :
+      pos == 3 ? 0.22 :
+        pos == 4 ? 0.12 :
+          pos == 5 ? 0.065 :
+            pos == 6 ? 0.035 :    // ~35 µs
+              0.020;                // position 7 = 20 µs → nuclear fast, exactly like real Rev D/E
+);
+
+function get_release_ms(pos) (
+  pos <= 1 ? 1100 :
+    pos == 2 ? 800 :
+      pos == 3 ? 600 :
+        pos == 4 ? 400 :
+          pos == 5 ? 250 :
+            pos == 6 ? 150 : 50;
+);
+
+// tanh / cosh
+function my_tanh(t) local(e2)(
+  e2 = exp(2 * t);
+(e2 - 1) / (e2 + 1);
+);
+function my_cosh(t) local(ex, enx)(
+  ex = exp(t); enx = exp(-t);
+(ex + enx) * 0.5;
+);
+
+function fet_f(x, d) local(t)(
+  t = d * x;
+my_tanh(t);
+);
+function fet_F(x, d) local(t, c)(
+  t = d * x;
+c = my_cosh(t);
+c <= 0 ? 0 : log(c) / d;
+);
+
+//----------------------------------------------------
+// @slider
+//----------------------------------------------------
+@slider
+ingain = 10 ^ (slider1 / 20);
+outgain = 10 ^ (slider6 / 20);
+
+ratio_idx = slider2 | 0;
+ratio = ratio_idx == 0 ? 4 :
+  ratio_idx == 1 ? 8 :
+    ratio_idx == 2 ? 12 : 20;
+
+// --- effective ratios (hardware-ish) ---  // <<< CHANGED
+eff_ratio =
+  ratio == 4 ? 4.3 :
+    ratio == 8 ? 8.8 :
+      ratio == 12 ? 14 :
+        20;
+
+atk_pos = slider3 | 0;
+rel_pos = slider4 | 0;
+atk_ms = get_attack_ms(atk_pos);
+rel_ms = get_release_ms(rel_pos);
+atk_a = exp(-1 / (srate * (atk_ms / 1000)));
+
+thresh_dB = slider7;
+
+// MASTER COLOR KNOB
+color = slider5;
+
+// --- detector coloration ---                // <<< CHANGED
+// Softer drive & sat so side-chain isn't smashed
+detector_sat = 0.10 + color * 0.50;   // 0.10 → 0.60
+base_det_drive = 1.0;
+detector_drive = base_det_drive + color * 0.25; // 1.0 → 1.25
+
+// Program-dependent release
+release_mult_min = 1.0;
+release_mult_max = 6.5;
+
+// Blackface-ish tilt for freq-dependent drive (pivot ~800 Hz)
+tilt_fc = 800;
+tilt_alpha = exp(-2 * $pi * tilt_fc / srate);
+
+tilt_amt = 0.18 * color;
+harm_mix = color;
+
+//----------------------------------------------------
+// @sample
+//----------------------------------------------------
+@sample
+xL = spl0 * ingain;
+xR = spl1 * ingain;
+
+// ===== DETECTOR WITH COLOR =====
+raw_detL = abs(xL);
+raw_detR = abs(xR);
+
+detL = detector_sat > 0 ? (
+  adaa_started_detL == 0 ? (
+    fet_f(raw_detL * detector_drive, detector_drive);
+x_prev_detL = raw_detL;
+adaa_started_detL = 1;
+  ) : (
+  dx = raw_detL - x_prev_detL;
+abs(dx) < adaa_dx_min ?
+  fet_f((raw_detL + x_prev_detL) * 0.5, detector_drive) :
+  (fet_F(raw_detL * detector_drive, detector_drive) - fet_F(x_prev_detL * detector_drive, detector_drive)) / dx;
+x_prev_detL = raw_detL;
+  )
+) : raw_detL;
+
+detR = detector_sat > 0 ? (
+  adaa_started_detR == 0 ? (
+    fet_f(raw_detR * detector_drive, detector_drive);
+x_prev_detR = raw_detR;
+adaa_started_detR = 1;
+  ) : (
+  dx = raw_detR - x_prev_detR;
+abs(dx) < adaa_dx_min ?
+  fet_f((raw_detR + x_prev_detR) * 0.5, detector_drive) :
+  (fet_F(raw_detR * detector_drive, detector_drive) - fet_F(x_prev_detR * detector_drive, detector_drive)) / dx;
+x_prev_detR = raw_detR;
+  )
+) : raw_detR;
+
+// ===== PROGRAM-DEPENDENT RELEASE =====
+release_mult_L = release_mult_min + (release_mult_max - release_mult_min) * (1 - exp(-max(0, GR_dB_L_prev) / 10));
+release_mult_R = release_mult_min + (release_mult_max - release_mult_min) * (1 - exp(-max(0, GR_dB_R_prev) / 10));
+
+rel_a_dynL = exp(-1 / (srate * (rel_ms / 1000) * release_mult_L));
+rel_a_dynR = exp(-1 / (srate * (rel_ms / 1000) * release_mult_R));
+
+// ===== SINGLE ENVELOPE PASS =====
+(detL > envL) ?
+  envL = atk_a * envL + (1 - atk_a) * detL :
+  envL = rel_a_dynL * envL + (1 - rel_a_dynL) * detL;
+
+(detR > envR) ?
+  envR = atk_a * envR + (1 - atk_a) * detR :
+  envR = rel_a_dynR * envR + (1 - rel_a_dynR) * detR;
+
+(envL < tiny) ? envL = tiny;
+(envR < tiny) ? envR = tiny;
+
+// ===== GAIN COMPUTER =====
+
+// Level in dB for each channel
+L_dB_L = LOG10_TO_DB * log(envL);
+L_dB_R = LOG10_TO_DB * log(envR);
+
+// "Over threshold" in dB
+overL = L_dB_L - thresh_dB;
+overR = L_dB_R - thresh_dB;
+
+// Safety clamp so we don't feed absurd numbers to the knee
+overL = max(overL, -80);
+overR = max(overR, -80);
+
+// Knee width in dB (tweak to taste; this is much saner than 16–32 dB)
+knee_width = 6 + 0.5 * ratio;   // e.g. 4:1 → 8 dB, 8:1 → 10 dB, etc.
+knee_half = knee_width * 0.5;
+
+// Effective ratio (your existing mapping: 4.3, 8.8, 14, 20...)
+eff_ratioL = eff_ratio;
+eff_ratioR = eff_ratio;
+
+// ---------- LEFT CHANNEL ----------
+knee_width <= 0 ? (
+
+  // Hard knee
+  overL <= 0 ? (
+    GR_dB_L = 0;
+  ) : (
+  GR_dB_L = overL * (1 - 1 / eff_ratioL);
+  );
+
+) : (
+
+  // Soft knee
+  overL <= -knee_half ? (
+    // Completely below knee → no GR
+    GR_dB_L = 0;
+  ) :
+overL >= knee_half ? (
+  // Completely above knee → full ratio
+  GR_dB_L = overL * (1 - 1 / eff_ratioL);
+  ) : (
+  // Inside knee: fade in GR quadratically
+  t = (overL + knee_half) / knee_width;   // 0..1
+full_GR = overL * (1 - 1 / eff_ratioL);
+GR_dB_L = full_GR * t * t;
+  );
+);
+
+// Never allow expansion
+GR_dB_L < 0 ? GR_dB_L = 0;
+
+// Linear gain
+gL = 10 ^ (-GR_dB_L / 20);
+
+// ---------- RIGHT CHANNEL ----------
+knee_width <= 0 ? (
+
+  // Hard knee
+  overR <= 0 ? (
+    GR_dB_R = 0;
+  ) : (
+  GR_dB_R = overR * (1 - 1 / eff_ratioR);
+  );
+
+) : (
+
+  // Soft knee
+  overR <= -knee_half ? (
+    GR_dB_R = 0;
+  ) :
+overR >= knee_half ? (
+  GR_dB_R = overR * (1 - 1 / eff_ratioR);
+  ) : (
+  t = (overR + knee_half) / knee_width;   // 0..1
+full_GR = overR * (1 - 1 / eff_ratioR);
+GR_dB_R = full_GR * t * t;
+  );
+);
+
+// Never allow expansion
+GR_dB_R < 0 ? GR_dB_R = 0;
+
+// Linear gain
+gR = 10 ^ (-GR_dB_R / 20);
+
+
+
+// ===== STORE GR FOR NEXT SAMPLE =====
+GR_dB_L_prev = GR_dB_L;
+GR_dB_R_prev = GR_dB_R;
+
+// ===== FET AUDIO-PATH SATURATION =====
+v_baseL = gL * xL;
+v_baseR = gR * xR;
+
+(color <= 0) ? (
+  yL = v_baseL;
+yR = v_baseR;
+) : (
+
+  // tilt only on sat branch
+  tilt_lf_L = (1 - tilt_alpha) * v_baseL + tilt_alpha * tilt_lf_L;
+tilt_hf_L = v_baseL - tilt_lf_L;
+
+gain_l = 1 + tilt_amt;
+gain_h = 1 - 0.6 * tilt_amt;
+
+preL = tilt_lf_L * gain_l + tilt_hf_L * gain_h;
+
+tilt_lf_R = (1 - tilt_alpha) * v_baseR + tilt_alpha * tilt_lf_R;
+tilt_hf_R = v_baseR - tilt_lf_R;
+
+preR = tilt_lf_R * gain_l + tilt_hf_R * gain_h;
+
+// GR-dependent drive
+drive_extra_L = color * 0.45 * (1 - exp(-max(0, GR_dB_L) / 10));
+drive_extra_R = color * 0.45 * (1 - exp(-max(0, GR_dB_R) / 10));
+drive_extra_L = min(drive_extra_L, 0.45);
+drive_extra_R = min(drive_extra_R, 0.45);
+
+fet_driveL = 1 + drive_extra_L;
+fet_driveR = 1 + drive_extra_R;
+
+(abs(fet_driveL - fet_drive_prevL) > 0.5) ? (adaa_startedL = 0; x_prevL = 0);
+(abs(fet_driveR - fet_drive_prevR) > 0.5) ? (adaa_startedR = 0; x_prevR = 0);
+fet_drive_prevL = fet_driveL;
+fet_drive_prevR = fet_driveR;
+
+// LEFT ADAA
+adaa_startedL == 0 ? (
+  satL = fet_f(preL, fet_driveL);
+x_prevL = preL;
+adaa_startedL = 1;
+  ) : (
+  dxL = preL - x_prevL;
+(abs(preL) < tiny && abs(x_prevL) < tiny) ? satL = 0 : (
+  FL = fet_F(preL, fet_driveL);
+FpL = fet_F(x_prevL, fet_driveL);
+numL = FL - FpL;
+(abs(dxL) < adaa_dx_min || abs(numL) < adaa_num_min) ?
+  satL = fet_f((preL + x_prevL) * 0.5, fet_driveL) :
+  satL = numL / dxL;
+    );
+x_prevL = preL;
+  );
+
+harmL = satL - preL;
+yL = v_baseL + harm_mix * harmL;
+
+// RIGHT ADAA
+adaa_startedR == 0 ? (
+  satR = fet_f(preR, fet_driveR);
+x_prevR = preR;
+adaa_startedR = 1;
+  ) : (
+  dxR = preR - x_prevR;
+(abs(preR) < tiny && abs(x_prevR) < tiny) ? satR = 0 : (
+  FR = fet_F(preR, fet_driveR);
+FpR = fet_F(x_prevR, fet_driveR);
+numR = FR - FpR;
+(abs(dxR) < adaa_dx_min || abs(numR) < adaa_num_min) ?
+  satR = fet_f((preR + x_prevR) * 0.5, fet_driveR) :
+  satR = numR / dxR;
+    );
+x_prevR = preR;
+  );
+
+harmR = satR - preR;
+yR = v_baseR + harm_mix * harmR;
+);
+
+// ===== METER =====
+GR_avg = (GR_dB_L + GR_dB_R) * 0.5;
+slider8 = -max(0, GR_avg);
+sliderchange(slider8);
+
+// ===== OUTPUT =====
+spl0 = yL * outgain;
+spl1 = yR * outgain;
+
+
+// ===================== @gfx (unchanged) =====================
+@gfx 260 80
+
+gfx_clear = 0;
+
+// outer panel
+gfx_r = gfx_g = gfx_b = 0.12; gfx_a = 1;
+gfx_rect(0, 0, gfx_w, gfx_h);
+
+// inner panel
+margin = 8;
+panel_x = margin;
+panel_y = 20;
+panel_w = gfx_w - 2 * margin;
+panel_h = gfx_h - panel_y - margin;
+
+gfx_r = gfx_g = gfx_b = 0.06; gfx_a = 1;
+gfx_rect(panel_x, panel_y, panel_w, panel_h);
+
+// border
+gfx_r = gfx_g = gfx_b = 0.35; gfx_a = 1;
+gfx_rect(panel_x, panel_y, panel_w, panel_h, 0);
+
+// label
+gfx_r = gfx_g = gfx_b = 0.9; gfx_a = 1;
+gfx_x = panel_x;
+gfx_y = 4;
+gfx_printf("GAIN REDUCTION");
+
+// meter geometry
+meter_x = panel_x + 6;
+meter_y = panel_y + 6;
+meter_w = panel_w - 12;
+meter_h = panel_h - 12;
+
+// outline
+gfx_r = gfx_g = gfx_b = 0.4; gfx_a = 1;
+gfx_rect(meter_x, meter_y, meter_w, meter_h, 0);
+
+// GR value (0..30 dB)
+gr = -slider8;
+gr < 0 ? gr = 0;
+gr > 30 ? gr = 30;
+
+norm = meter_w > 0 ? (gr / 30) : 0;
+fill_w = meter_w * norm;
+
+// background
+gfx_r = 0.05; gfx_g = 0.15; gfx_b = 0.05; gfx_a = 1;
+gfx_rect(meter_x + 1, meter_y + 1, meter_w - 2, meter_h - 2);
+
+// tick marks
+gfx_r = gfx_g = gfx_b = 0.6; gfx_a = 1;
+tick_h = meter_h * 0.4;
+
+i = 0;
+loop(7,
+  t = i / 6;
+tx = meter_x + meter_w - t * meter_w;
+ty0 = meter_y + (meter_h - tick_h) * 0.5;
+ty1 = ty0 + tick_h;
+gfx_line(tx, ty0, tx, ty1);
+i += 1;
+);
+
+// filled bar (right → left)
+fill_w > 1 ? (
+  gfx_r = 0.15; gfx_g = 0.85; gfx_b = 0.25; gfx_a = 1;
+gfx_rect(meter_x + meter_w - 1 - fill_w,
+  meter_y + 2,
+  fill_w,
+  meter_h - 4);
+);
+
+// numeric readout
+gfx_r = gfx_g = gfx_b = 0.75; gfx_a = 1;
+gfx_x = meter_x;
+gfx_y = meter_y + meter_h + 2;
+gfx_printf("%4.1f dB", gr);
+

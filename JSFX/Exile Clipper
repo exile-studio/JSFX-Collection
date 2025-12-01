@@ -1,0 +1,222 @@
+desc:Exile Clipper
+
+// ------------------------------------------------------------
+// Exile Studio – JSFX Collection
+// Name   : Exile Clipper
+// Version: 1.0
+// Author : Michele Raggi
+// Repo   : https://github.com/exile-studio/JSFX-Collection
+//
+// License: Creative Commons Attribution 4.0 International (CC BY 4.0)
+//          You are free to use, modify, and redistribute this file,
+//          including in commercial projects, as long as you provide
+//          appropriate credit to "exile_studio" and indicate if changes
+//          were made.
+//
+// Additional notes:
+//   All references to existing brands, products, hardware models,
+//   or company names are used purely for descriptive and comparative
+//   purposes. They are not endorsements, not affiliations, and 
+//   definitely not official models.
+//   And yes - they’re written in clear text because, honestly,
+//   who the fuck cares.
+//
+// Full license text:
+//   https://creativecommons.org/licenses/by/4.0/
+//
+// Support / warranty:
+//   None. Use at your own risk.
+// ------------------------------------------------------------
+
+slider1:-0.3<-30.0,0.0,0.1>Ceiling (dBFS)
+slider2:3<0,12,0.1>Knee Width (dB)
+slider3:0<-24.0,0.0,0.1>Gain Reduction (dB)        // current GR meter (read-only)
+slider4:0<-24.0,0.0,0.1>Peak GR (dB)               // peak hold (read-only)
+slider5:0<0,1,1{Run,Reset}>Peak Reset              // click to reset peak
+
+//----------------------------------------------------
+// @init
+//----------------------------------------------------
+@init
+// ADAA state (normalized cubic domain)
+adaa_prevL = 0;
+adaa_prevR = 0;
+
+// GR meter state (dB)
+meter_gr_db     = 0;     // current displayed GR (<= 0)
+meter_attack    = 0.6;   // how fast it goes to more GR (more negative)
+meter_release   = 0.2;   // how fast it floats back to 0 dB
+block_min_gr_db = 0;     // most negative gain_db in current block
+
+// Peak hold
+peak_gr_db = 0;          // most negative meter_gr_db since last reset
+
+// constants
+ln10over20       = 0.115129254;  // ln(10)/20
+twenty_over_ln10 = 8.685889638;  // 20/log(10)
+
+//----------------------------------------------------
+// Normalized ADAA cubic soft clip
+//----------------------------------------------------
+function adaa_cubic_norm(x, x_prev)
+(
+    du = x - x_prev;
+
+    abs(du) > 0.0000001 ?
+    (
+        F     = 1.5 * (x*x*0.5 - x*x*x*x*0.083333333333);
+        Fprev = 1.5 * (x_prev*x_prev*0.5 - x_prev*x_prev*x_prev*x_prev*0.083333333333);
+        (F - Fprev) / du;
+    ) :
+    (
+        // small-step fallback: midpoint
+        xm = (x + x_prev) * 0.5;
+        1.5 * (xm - xm*xm*xm/3);
+    );
+);
+
+//----------------------------------------------------
+// @slider
+//----------------------------------------------------
+@slider
+ceiling_db = slider1;           // limiter threshold in dBFS
+knee_db    = slider2;
+knee_db < 0 ? knee_db = 0;
+
+// Peak reset button
+slider5 >= 0.5 ? (
+    // on "Reset" -> clear peak to current GR and snap back to Run
+    peak_gr_db = meter_gr_db;
+    peak_gr_db < -24 ? peak_gr_db = -24;
+    peak_gr_db >   0 ? peak_gr_db = 0;
+    slider4 = peak_gr_db;
+    slider5 = 0; // back to "Run"
+);
+
+//----------------------------------------------------
+// @block – update meter and peak once per block
+//----------------------------------------------------
+@block
+// take the most negative gain_db seen in this block
+inst_gr_db = block_min_gr_db;  // <= 0, 0 means no GR this block
+
+// dead-zone: ignore tiny GR (e.g. < 0.25 dB)
+inst_gr_db > -0.25 ? inst_gr_db = 0;
+
+// clamp range
+inst_gr_db < -24 ? inst_gr_db = -24;
+inst_gr_db >   0 ? inst_gr_db = 0;
+
+// smooth in dB
+inst_gr_db < meter_gr_db ?
+(
+    // more GR (more negative): attack
+    meter_gr_db = meter_gr_db + (inst_gr_db - meter_gr_db) * meter_attack;
+)
+:
+(
+    // less GR (towards 0 dB): release
+    meter_gr_db = meter_gr_db + (inst_gr_db - meter_gr_db) * meter_release;
+);
+
+// update current GR slider
+slider3 = meter_gr_db;
+
+// update peak hold (more negative = more GR)
+meter_gr_db < peak_gr_db ? peak_gr_db = meter_gr_db;
+
+// clamp and push to slider4
+peak_gr_db < -24 ? peak_gr_db = -24;
+peak_gr_db >   0 ? peak_gr_db = 0;
+slider4 = peak_gr_db;
+
+// reset for next block (start assuming no GR)
+block_min_gr_db = 0;
+
+//----------------------------------------------------
+// @sample
+//----------------------------------------------------
+@sample
+// 1) Raw input
+inL_raw = spl0;
+inR_raw = spl1;
+
+// 2) ADAA SOFT CLIP ON RAW SIGNAL (anti-alias nonlinearity)
+adaa_threshold = 0.98; // start shaping near full scale
+
+sL = inL_raw;
+sR = inR_raw;
+
+// left channel ADAA
+abs(sL) > adaa_threshold ? (
+    sL_shaped = adaa_cubic_norm(sL, adaa_prevL);
+    adaa_prevL = sL;      // state uses pre-shape value
+    sL = sL_shaped;
+) : (
+    adaa_prevL = sL;
+);
+
+// right channel ADAA
+abs(sR) > adaa_threshold ? (
+    sR_shaped = adaa_cubic_norm(sR, adaa_prevR);
+    adaa_prevR = sR;
+    sR = sR_shaped;
+) : (
+    adaa_prevR = sR;
+);
+
+// signal into limiter
+preL = sL;
+preR = sR;
+
+// 3) LIMITER (soft-knee) ON ADAA OUTPUT
+peak = max(abs(preL), abs(preR));
+
+gain_db = 0;   // limiter GR in dB (<= 0)
+gain    = 1.0;
+
+peak > 0 ? (
+    peak_db   = twenty_over_ln10 * log(peak);
+    thresh_db = ceiling_db;
+
+    knee_half = knee_db * 0.5;
+
+    (knee_db <= 0) ? (
+        // pure hard limiter, no knee
+        peak_db > thresh_db ? (
+            gain_db = thresh_db - peak_db;
+        ) : (
+            gain_db = 0;
+        );
+    ) :
+    (
+        (peak_db <= thresh_db - knee_half) ? (
+            // below knee: no GR
+            gain_db = 0;
+        ) :
+        (peak_db >= thresh_db + knee_half) ? (
+            // above knee: full hard limiting
+            gain_db = thresh_db - peak_db;
+        ) :
+        (
+            // within knee: quadratic soft knee
+            t = (peak_db - (thresh_db - knee_half)) / knee_db; // 0..1
+            full_g_db = thresh_db - peak_db;                   // hard-limit diff
+            gain_db = full_g_db * t * t;
+        );
+    );
+
+    gain = 10^(gain_db * ln10over20);
+);
+
+// track most negative gain_db in this block
+gain_db < block_min_gr_db ? block_min_gr_db = gain_db;
+
+// apply limiter gain
+postL = preL * gain;
+postR = preR * gain;
+
+// 4) Output
+spl0 = postL;
+spl1 = postR;
+

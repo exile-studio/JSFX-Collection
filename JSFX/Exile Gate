@@ -1,0 +1,297 @@
+desc:Exile Gate
+
+// ------------------------------------------------------------
+// Exile Studio – JSFX Collection
+// Name   : Exile Gate
+// Version: 1.0
+// Author : Michele Raggi
+// Repo   : https://github.com/exile-studio/JSFX-Collection
+//
+// License: Creative Commons Attribution 4.0 International (CC BY 4.0)
+//          You are free to use, modify, and redistribute this file,
+//          including in commercial projects, as long as you provide
+//          appropriate credit to "exile_studio" and indicate if changes
+//          were made.
+//
+// Additional notes:
+//   All references to existing brands, products, hardware models,
+//   or company names are used purely for descriptive and comparative
+//   purposes. They are not endorsements, not affiliations, and 
+//   definitely not official models.
+//   And yes - they’re written in clear text because, honestly,
+//   who the fuck cares.
+//
+// Full license text:
+//   https://creativecommons.org/licenses/by/4.0/
+//
+// Support / warranty:
+//   None. Use at your own risk.
+// ------------------------------------------------------------
+
+//----------------------------------------------------
+// Sliders
+//----------------------------------------------------
+slider1: 0 < -24, 24, 0.1 > Input Trim(dB)
+slider2: -40 < -80, -6, 0.5 > Threshold(dB)
+slider3: -40 < -80, -6, 1 > Range(dB)           // max attenuation (negative)
+slider4: 4 < 1, 20, 0.1 > Ratio                // >1 = steeper expansion
+slider5: 5 < 0.1, 100, 0.1 > Attack(ms)       // gain attack
+slider6: 200 < 5, 2000, 5 > Release(ms)         // gain release
+slider7: 1 < 0, 10, 0.1 > Lookahead(ms)       // 0–10 ms, with PDC
+slider8: 120 < 20, 500, 5 > Sidechain HPF(Hz)
+slider9: 0 < -24, 24, 0.1 > Output Gain(dB)
+slider10: 0 < 0, 1, 1{ Peak, RMS }> Detector Mode
+slider11: 0 < 0, 60, 0.1 > Gain Reduction(dB)  // meter only
+
+//----------------------------------------------------
+// @init
+//----------------------------------------------------
+@init
+
+gain = 1;
+env = 0;
+
+//--------------------
+// Lookahead buffer
+//--------------------
+la_buf_size = 65536;    // supports >10 ms at any sane sample rate
+la_wr = 0;
+
+la_bufL[la_buf_size];
+la_bufR[la_buf_size];
+
+// sidechain HPF biquad states
+sc_x1 = 0;
+sc_x2 = 0;
+sc_y1 = 0;
+sc_y2 = 0;
+
+// tiny
+tiny = 0.000000000001;
+
+// HPF coeffs
+sc_b0 = 0;
+sc_b1 = 0;
+sc_b2 = 0;
+sc_a1 = 0;
+sc_a2 = 0;
+
+// detector envelope coeffs
+env_att_a = 0;
+env_rel_a = 0;
+
+// gain envelope coeffs
+gain_att_a = 0;
+gain_rel_a = 0;
+
+// lookahead samples + PDC
+lookahead_samples = 0;
+pdc_delay = 0;
+
+//----------------------------------------------------
+// Helpers
+//----------------------------------------------------
+function db2lin(db)
+(
+    pow(10, db / 20);
+);
+
+function lin2db_amp(lin) // amplitude
+(
+    20 * log10(lin);
+);
+
+//----------------------------------------------------
+// @slider
+//----------------------------------------------------
+@slider
+
+in_gain = db2lin(slider1);
+out_gain = db2lin(slider9);
+
+thresh_db = slider2;
+range_db = slider3;              // negative
+ratio = max(slider4, 1.0);
+
+det_mode_rms = slider10;
+
+// detector ballistics (fixed, pretty fast)
+env_att_ms = 1.0;
+env_rel_ms = 80.0;
+
+env_att_a = exp(-1 / (env_att_ms * 0.001 * srate));
+env_rel_a = exp(-1 / (env_rel_ms * 0.001 * srate));
+
+// gain ballistics (user controlled)
+attack_ms = max(slider5, 0.1);
+release_ms = max(slider6, 5.0);
+
+gain_att_a = exp(-1 / (attack_ms * 0.001 * srate));
+gain_rel_a = exp(-1 / (release_ms * 0.001 * srate));
+
+// sidechain HPF (12 dB/oct, RBJ-style)
+f = max(20, min(slider8, srate * 0.45));
+
+omega = 2 * $pi * f / srate;
+sn = sin(omega);
+cs = cos(omega);
+Q = 0.70710678;
+alpha = sn / (2 * Q);
+
+inv_a0 = 1 / (1 + alpha);
+
+// High-pass biquad normalized
+sc_b0 = (1 + cs) * 0.5 * inv_a0;
+sc_b1 = -(1 + cs) * inv_a0;
+sc_b2 = sc_b0;
+sc_a1 = -2 * cs * inv_a0;
+sc_a2 = (1 - alpha) * inv_a0;
+
+// lookahead (ms → samples)
+lookahead_ms = max(slider7, 0);
+lookahead_ms > 10 ? lookahead_ms = 10;
+
+lookahead_samples = floor(lookahead_ms * 0.001 * srate + 0.5);
+lookahead_samples >= la_buf_size ? lookahead_samples = la_buf_size - 1;
+
+// report latency to REAPER for PDC
+pdc_delay = lookahead_samples;
+
+//----------------------------------------------------
+// @block  (update GR meter at control rate)
+//----------------------------------------------------
+@block
+
+gain_lin = max(gain, tiny);
+gr_display = -lin2db_amp(gain_lin); // 0 = no GR, >0 = reduction
+gr_display < 0 ? gr_display = 0;
+gr_display > 60 ? gr_display = 60;
+
+slider11 = gr_display;
+
+//----------------------------------------------------
+// @sample
+//----------------------------------------------------
+@sample
+
+// read current input
+inL = spl0;
+inR = spl1;
+
+//--------------------
+// Detector path (no lookahead)
+//--------------------
+
+// sidechain signal (mono)
+sc = (inL + inR) * 0.5 * in_gain;
+
+// 12 dB/oct HPF (biquad)
+x = sc;
+y = sc_b0 * x + sc_b1 * sc_x1 + sc_b2 * sc_x2
+    - sc_a1 * sc_y1 - sc_a2 * sc_y2;
+
+sc_x2 = sc_x1;
+sc_x1 = x;
+sc_y2 = sc_y1;
+sc_y1 = y;
+
+sc_hpf = y;
+
+// detector (Peak or RMS)
+det_mode_rms ?
+    (
+        // RMS-ish power detector
+        det = sc_hpf * sc_hpf;      // power
+)
+:
+(
+    // Peak detector
+    det = abs(sc_hpf);          // amplitude
+);
+
+// envelope follower (detector)
+det > env ?
+    (
+        env = env + (det - env) * (1 - env_att_a);
+)
+:
+(
+    env = env + (det - env) * (1 - env_rel_a);
+);
+
+env < tiny ? env = tiny;
+
+// convert env to dB
+det_mode_rms ?
+    (
+        // power → 10*log10
+        env_db = 10 * log10(env);
+)
+:
+(
+    // amplitude → 20*log10
+    env_db = 20 * log10(env);
+);
+
+env_db < -160 ? env_db = -160;
+
+//--------------------
+// Compute target gain in dB (pure expander)
+//--------------------
+gain_target_db = 0;
+
+env_db >= thresh_db ?
+    (
+        // above threshold: no GR
+        gain_target_db = 0;
+)
+:
+(
+    // below threshold: downward expansion
+    delta_db = env_db - thresh_db;          // negative
+gr_db = (ratio - 1) * delta_db;         // negative, grows with depth
+// clamp to max range
+gain_target_db = max(gr_db, range_db);  // range_db is negative
+);
+
+// convert target gain to linear
+gain_target = db2lin(gain_target_db);
+
+// smooth gain with user Attack / Release
+gain_target > gain ?
+    (
+        gain = gain + (gain_target - gain) * (1 - gain_att_a);
+)
+:
+(
+    gain = gain + (gain_target - gain) * (1 - gain_rel_a);
+);
+
+//--------------------
+// Lookahead audio path
+//--------------------
+
+// write current dry input into buffer
+la_bufL[la_wr] = inL;
+la_bufR[la_wr] = inR;
+
+// advance write pointer
+la_wr += 1;
+la_wr >= la_buf_size ? la_wr = 0;
+
+// compute read index (delayed by lookahead_samples)
+la_rd = la_wr - lookahead_samples;
+la_rd < 0 ? la_rd += la_buf_size;
+
+// fetch delayed sample
+delL = la_bufL[la_rd];
+delR = la_bufR[la_rd];
+
+//--------------------
+// Apply gain + trims
+//--------------------
+g = gain * in_gain * out_gain;
+
+spl0 = delL * g;
+spl1 = delR * g;
+
