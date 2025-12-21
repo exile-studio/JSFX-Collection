@@ -1,6 +1,6 @@
 # Exile Studio – JSFX Collection
 
-There are countless free and less-than-free plugins available; knew some, bought some, use some, but kept feeling on most of them there's something amiss.  
+There are countless free and less-than-free plugins available; knew some, bought some, used some, but kept feeling on most of them there's something amiss.  
 Might be quality-of-life-related UI controls, or just strictly **q u a l i t y   o f   s o u n d**, so I decided to take fate in my hands and code my own.  
 After many late hours, scotch glasses, and ungodly curses, this is the result I wanted to share.
 
