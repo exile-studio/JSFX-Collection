@@ -2,7 +2,7 @@ desc:Exile Stereo Delay LA
 // ------------------------------------------------------------
 // Exile Studio – JSFX Collection
 // Name   : Exile Stereo Delay LA
-// Version: 1.0
+// Version: 1.2
 // Author : Michele Raggi
 // Repo   : https://github.com/exile-studio/JSFX-Collection
 //
@@ -311,10 +311,10 @@ mix >= 1 ? (
 spl1 = wetR;
 ) :
 (
-  t = mix;
+// stronger taper so low mix values are less sensitive
+t = mix * mix * mix;
 dry_gain = sqrt(1 - t);
 wet_gain = sqrt(t);
 spl0 = inL * dry_gain + wetL * wet_gain;
 spl1 = inR * dry_gain + wetR * wet_gain;
 );
-

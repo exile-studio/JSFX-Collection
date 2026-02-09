@@ -3,7 +3,7 @@ desc:Exile 1176 Compressor
 // ------------------------------------------------------------
 // Exile Studio – JSFX Collection
 // Name   : Exile 1176 Compressor
-// Version: 1.0
+// Version: 1.12
 // Author : Michele Raggi
 // Repo   : https://github.com/exile-studio/JSFX-Collection
 //
@@ -37,7 +37,7 @@ slider3: 4 < 1, 7, 1 > Attack(1 = Slow, 7 = Fast)
 slider4: 4 < 1, 7, 1 > Release(1 = Slow, 7 = Fast)
 slider5: 0.4 < 0, 1, 0.01 > Color(0 = clean LN, 1 = dirty Rev A)
 slider6: 0 < -24, 24, 0.1 > Output(dB)
-slider7: -24 < -36, -6, 0.1 > Ref Level(dB)
+slider7: 0 < -6, 6, 0.1 > -Legacy Trim(unused)
 slider8: 0 < -40, 0, 0.1 > Gain Reduction(dB)
 
 //----------------------------------------------------
@@ -47,9 +47,14 @@ slider8: 0 < -40, 0, 0.1 > Gain Reduction(dB)
 tiny = 0.000000000000000001;
 
 envL = 0; envR = 0;
+env_fastL = 0; env_fastR = 0;
+env_slowL = 0; env_slowR = 0;
+fb_tap_prevL = 0; fb_tap_prevR = 0;
 
-adaa_dx_min = 0.000000000001;
-adaa_num_min = 0.000000000000000001;
+// ADAA safety epsilons (conservative to avoid divide-by-tiny spikes)
+adaa_dx_min = 0.0000001;
+adaa_num_min = 0.0000000001;
+drive_change_eps = 0.0005;
 
 // Audio path ADAA
 x_prevL = 0; x_prevR = 0;
@@ -88,6 +93,16 @@ function get_release_ms(pos) (
         pos == 4 ? 400 :
           pos == 5 ? 250 :
             pos == 6 ? 150 : 50;
+);
+
+// Mild nonlinear control law to mimic 1176's less-linear FET behavior.
+function fet_over_nl(over, eff_r) local(k, t, rnorm)(
+  over <= 0 ? 0 : (
+    rnorm = min(1, max(0, (eff_r - 4) / 16)); // 4:1 -> 0, 20:1 -> 1
+k = 0.12 + 0.10 * rnorm;                  // stronger bend at higher ratios
+t = 10;                                   // dB scale for curvature onset
+over * (1 + k * (1 - exp(-over / t)));
+  );
 );
 
 // tanh / cosh
@@ -134,8 +149,14 @@ rel_pos = slider4 | 0;
 atk_ms = get_attack_ms(atk_pos);
 rel_ms = get_release_ms(rel_pos);
 atk_a = exp(-1 / (srate * (atk_ms / 1000)));
+rel_fast_a = exp(-1 / (srate * (rel_ms / 1000)));
+rel_slow_a = exp(-1 / (srate * ((rel_ms * 4.5) / 1000)));
 
-thresh_dB = slider7;
+// 1176-style behavior: fixed internal threshold, GR driven by Input and program level.
+// slider7 kept only as hidden legacy slot for compatibility with old preset states.
+thresh_base_dB = -12;
+thresh_dB = thresh_base_dB;
+thresh_lin = 10 ^ (thresh_dB / 20);
 
 // MASTER COLOR KNOB
 color = slider5;
@@ -146,9 +167,11 @@ detector_sat = 0.10 + color * 0.50;   // 0.10 → 0.60
 base_det_drive = 1.0;
 detector_drive = base_det_drive + color * 0.25; // 1.0 → 1.25
 
-// Program-dependent release
-release_mult_min = 1.0;
-release_mult_max = 6.5;
+// Ratio-to-control slope for analog-style gain-cell law.
+ratio_ctrl_k =
+  ratio == 4 ? 0.50 :
+    ratio == 8 ? 0.72 :
+      ratio == 12 ? 0.90 : 1.15;
 
 // Blackface-ish tilt for freq-dependent drive (pivot ~800 Hz)
 tilt_fc = 800;
@@ -156,6 +179,9 @@ tilt_alpha = exp(-2 * $pi * tilt_fc / srate);
 
 tilt_amt = 0.18 * color;
 harm_mix = color;
+
+// Feedback detector trim (calibrated): keeps usable threshold mapping with feedback tap.
+fb_detect_boost = 2.0; // ~+6.0 dB
 
 //----------------------------------------------------
 // @sample
@@ -165,142 +191,93 @@ xL = spl0 * ingain;
 xR = spl1 * ingain;
 
 // ===== DETECTOR WITH COLOR =====
-raw_detL = abs(xL);
-raw_detR = abs(xR);
+// Feedback-style detector tap: previous post-gain sample (bootstrap only when tap is silent).
+raw_detL = abs(fb_tap_prevL) * fb_detect_boost;
+raw_detR = abs(fb_tap_prevR) * fb_detect_boost;
+(raw_detL < tiny) ? raw_detL = abs(xL) * fb_detect_boost;
+(raw_detR < tiny) ? raw_detR = abs(xR) * fb_detect_boost;
 
-detL = detector_sat > 0 ? (
+
+detector_sat > 0 ? (
   adaa_started_detL == 0 ? (
-    fet_f(raw_detL * detector_drive, detector_drive);
+    det_satL = fet_f(raw_detL, detector_drive);
+detL = raw_detL + detector_sat * (det_satL - raw_detL);
 x_prev_detL = raw_detL;
 adaa_started_detL = 1;
   ) : (
   dx = raw_detL - x_prev_detL;
-abs(dx) < adaa_dx_min ?
+det_satL = abs(dx) < adaa_dx_min ?
   fet_f((raw_detL + x_prev_detL) * 0.5, detector_drive) :
-  (fet_F(raw_detL * detector_drive, detector_drive) - fet_F(x_prev_detL * detector_drive, detector_drive)) / dx;
+  (fet_F(raw_detL, detector_drive) - fet_F(x_prev_detL, detector_drive)) / dx;
+detL = raw_detL + detector_sat * (det_satL - raw_detL);
 x_prev_detL = raw_detL;
-  )
-) : raw_detL;
+  );
+) : detL = raw_detL;
 
-detR = detector_sat > 0 ? (
+detector_sat > 0 ? (
   adaa_started_detR == 0 ? (
-    fet_f(raw_detR * detector_drive, detector_drive);
+    det_satR = fet_f(raw_detR, detector_drive);
+detR = raw_detR + detector_sat * (det_satR - raw_detR);
 x_prev_detR = raw_detR;
 adaa_started_detR = 1;
   ) : (
   dx = raw_detR - x_prev_detR;
-abs(dx) < adaa_dx_min ?
+det_satR = abs(dx) < adaa_dx_min ?
   fet_f((raw_detR + x_prev_detR) * 0.5, detector_drive) :
-  (fet_F(raw_detR * detector_drive, detector_drive) - fet_F(x_prev_detR * detector_drive, detector_drive)) / dx;
+  (fet_F(raw_detR, detector_drive) - fet_F(x_prev_detR, detector_drive)) / dx;
+detR = raw_detR + detector_sat * (det_satR - raw_detR);
 x_prev_detR = raw_detR;
-  )
-) : raw_detR;
+  );
+) : detR = raw_detR;
 
-// ===== PROGRAM-DEPENDENT RELEASE =====
-release_mult_L = release_mult_min + (release_mult_max - release_mult_min) * (1 - exp(-max(0, GR_dB_L_prev) / 10));
-release_mult_R = release_mult_min + (release_mult_max - release_mult_min) * (1 - exp(-max(0, GR_dB_R_prev) / 10));
+// ===== DUAL-STAGE ENVELOPE (analog-like attack/release) =====
+slow_w_L = 0.20 + 0.55 * (1 - exp(-max(0, GR_dB_L_prev) / 8));
+slow_w_R = 0.20 + 0.55 * (1 - exp(-max(0, GR_dB_R_prev) / 8));
+slow_w_L = min(max(slow_w_L, 0), 0.85);
+slow_w_R = min(max(slow_w_R, 0), 0.85);
 
-rel_a_dynL = exp(-1 / (srate * (rel_ms / 1000) * release_mult_L));
-rel_a_dynR = exp(-1 / (srate * (rel_ms / 1000) * release_mult_R));
+(detL > env_fastL) ?
+  env_fastL = atk_a * env_fastL + (1 - atk_a) * detL :
+  env_fastL = rel_fast_a * env_fastL + (1 - rel_fast_a) * detL;
 
-// ===== SINGLE ENVELOPE PASS =====
-(detL > envL) ?
-  envL = atk_a * envL + (1 - atk_a) * detL :
-  envL = rel_a_dynL * envL + (1 - rel_a_dynL) * detL;
+(detR > env_fastR) ?
+  env_fastR = atk_a * env_fastR + (1 - atk_a) * detR :
+  env_fastR = rel_fast_a * env_fastR + (1 - rel_fast_a) * detR;
 
-(detR > envR) ?
-  envR = atk_a * envR + (1 - atk_a) * detR :
-  envR = rel_a_dynR * envR + (1 - rel_a_dynR) * detR;
+(detL > env_slowL) ?
+  env_slowL = atk_a * env_slowL + (1 - atk_a) * detL :
+  env_slowL = rel_slow_a * env_slowL + (1 - rel_slow_a) * detL;
+
+(detR > env_slowR) ?
+  env_slowR = atk_a * env_slowR + (1 - atk_a) * detR :
+  env_slowR = rel_slow_a * env_slowR + (1 - rel_slow_a) * detR;
+
+envL = (1 - slow_w_L) * env_fastL + slow_w_L * env_slowL;
+envR = (1 - slow_w_R) * env_fastR + slow_w_R * env_slowR;
 
 (envL < tiny) ? envL = tiny;
 (envR < tiny) ? envR = tiny;
 
-// ===== GAIN COMPUTER =====
+// ===== GAIN COMPUTER (analog-style control-voltage law) =====
+over_cv_L = max(envL - thresh_lin, 0);
+over_cv_R = max(envR - thresh_lin, 0);
 
-// Level in dB for each channel
-L_dB_L = LOG10_TO_DB * log(envL);
-L_dB_R = LOG10_TO_DB * log(envR);
+normL = over_cv_L / max(thresh_lin, tiny);
+normR = over_cv_R / max(thresh_lin, tiny);
+normL = min(normL, 40);
+normR = min(normR, 40);
 
-// "Over threshold" in dB
-overL = L_dB_L - thresh_dB;
-overR = L_dB_R - thresh_dB;
+controlL = ratio_ctrl_k * log(1 + normL);
+controlR = ratio_ctrl_k * log(1 + normR);
 
-// Safety clamp so we don't feed absurd numbers to the knee
-overL = max(overL, -80);
-overR = max(overR, -80);
+gL = exp(-controlL);
+gR = exp(-controlR);
 
-// Knee width in dB (tweak to taste; this is much saner than 16–32 dB)
-knee_width = 6 + 0.5 * ratio;   // e.g. 4:1 → 8 dB, 8:1 → 10 dB, etc.
-knee_half = knee_width * 0.5;
+gL = min(max(gL, tiny), 1);
+gR = min(max(gR, tiny), 1);
 
-// Effective ratio (your existing mapping: 4.3, 8.8, 14, 20...)
-eff_ratioL = eff_ratio;
-eff_ratioR = eff_ratio;
-
-// ---------- LEFT CHANNEL ----------
-knee_width <= 0 ? (
-
-  // Hard knee
-  overL <= 0 ? (
-    GR_dB_L = 0;
-  ) : (
-  GR_dB_L = overL * (1 - 1 / eff_ratioL);
-  );
-
-) : (
-
-  // Soft knee
-  overL <= -knee_half ? (
-    // Completely below knee → no GR
-    GR_dB_L = 0;
-  ) :
-overL >= knee_half ? (
-  // Completely above knee → full ratio
-  GR_dB_L = overL * (1 - 1 / eff_ratioL);
-  ) : (
-  // Inside knee: fade in GR quadratically
-  t = (overL + knee_half) / knee_width;   // 0..1
-full_GR = overL * (1 - 1 / eff_ratioL);
-GR_dB_L = full_GR * t * t;
-  );
-);
-
-// Never allow expansion
-GR_dB_L < 0 ? GR_dB_L = 0;
-
-// Linear gain
-gL = 10 ^ (-GR_dB_L / 20);
-
-// ---------- RIGHT CHANNEL ----------
-knee_width <= 0 ? (
-
-  // Hard knee
-  overR <= 0 ? (
-    GR_dB_R = 0;
-  ) : (
-  GR_dB_R = overR * (1 - 1 / eff_ratioR);
-  );
-
-) : (
-
-  // Soft knee
-  overR <= -knee_half ? (
-    GR_dB_R = 0;
-  ) :
-overR >= knee_half ? (
-  GR_dB_R = overR * (1 - 1 / eff_ratioR);
-  ) : (
-  t = (overR + knee_half) / knee_width;   // 0..1
-full_GR = overR * (1 - 1 / eff_ratioR);
-GR_dB_R = full_GR * t * t;
-  );
-);
-
-// Never allow expansion
-GR_dB_R < 0 ? GR_dB_R = 0;
-
-// Linear gain
-gR = 10 ^ (-GR_dB_R / 20);
+GR_dB_L = -LOG10_TO_DB * log(gL);
+GR_dB_R = -LOG10_TO_DB * log(gR);
 
 
 
@@ -340,8 +317,8 @@ drive_extra_R = min(drive_extra_R, 0.45);
 fet_driveL = 1 + drive_extra_L;
 fet_driveR = 1 + drive_extra_R;
 
-(abs(fet_driveL - fet_drive_prevL) > 0.5) ? (adaa_startedL = 0; x_prevL = 0);
-(abs(fet_driveR - fet_drive_prevR) > 0.5) ? (adaa_startedR = 0; x_prevR = 0);
+(abs(fet_driveL - fet_drive_prevL) > drive_change_eps) ? (adaa_startedL = 0; x_prevL = 0);
+(abs(fet_driveR - fet_drive_prevR) > drive_change_eps) ? (adaa_startedR = 0; x_prevR = 0);
 fet_drive_prevL = fet_driveL;
 fet_drive_prevR = fet_driveR;
 
@@ -363,8 +340,7 @@ numL = FL - FpL;
 x_prevL = preL;
   );
 
-harmL = satL - preL;
-yL = v_baseL + harm_mix * harmL;
+yL = preL + harm_mix * (satL - preL);
 
 // RIGHT ADAA
 adaa_startedR == 0 ? (
@@ -384,9 +360,16 @@ numR = FR - FpR;
 x_prevR = preR;
   );
 
-harmR = satR - preR;
-yR = v_baseR + harm_mix * harmR;
+yR = preR + harm_mix * (satR - preR);
 );
+
+// Hard safety guards for rare numeric blowups.
+(yL != yL || abs(yL) > 16) ? yL = 0;
+(yR != yR || abs(yR) > 16) ? yR = 0;
+
+// 1176-ish feedback tap: post gain-control nonlinearity (what the loop effectively "hears")
+fb_tap_prevL = yL;
+fb_tap_prevR = yR;
 
 // ===== METER =====
 GR_avg = (GR_dB_L + GR_dB_R) * 0.5;
@@ -477,4 +460,3 @@ gfx_r = gfx_g = gfx_b = 0.75; gfx_a = 1;
 gfx_x = meter_x;
 gfx_y = meter_y + meter_h + 2;
 gfx_printf("%4.1f dB", gr);
-
