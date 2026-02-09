@@ -1,0 +1,276 @@
+desc:Exile API Compressor
+
+slider1:thresh_db=-18<-60,0,0.1>Threshold (dB)
+slider2:ratio=4<1,20,0.01>Ratio
+slider3:att_ms=10<0.1,50,0.1>Attack (ms)
+slider4:rel_ms=200<50,1500,1>Release (ms)
+slider5:knee_db=6<0,12,0.1>Knee (dB)
+slider6:makeup_db=0<-24,24,0.1>Makeup (dB)
+slider7:outtrim_db=0<-24,24,0.1>Output Trim (dB)
+
+slider8:auto_rel=1<0,1,1{Off,On}>Auto Release
+slider9:sc_hpf_hz=0<0,250,1>SC HPF (Hz, 0=Off)
+slider10:thrust=0<0,2,1{Normal,Med,Loud}>Thrust
+
+slider11:sat_amt=10<0,100,0.1>Sat Amount (%)
+slider12:link_pct=100<0,100,1>Stereo Link (%)
+
+slider13:gr_meter=0<0,24,0.1>GR (dB) (meter)
+
+@init
+eps = 0.00000000000000000001;
+two_pi = 2*$pi;
+
+envL = envR = 0;
+envL_prev = envR_prev = 0;
+
+sc_hp_a = 0;
+sc_hp_zL = sc_hp_zR = 0;
+sc_hp_xL = sc_hp_xR = 0; // FIX: init previous x
+
+th_lp_a = 0;
+th_lp_zL = th_lp_zR = 0;
+
+x1L = x1R = 0; // previous sample for ADAA
+
+gr_meter_s = 0;
+gr_meter_a = 0; // set in @slider
+
+function db2lin(db) (10^(db/20));
+function lin2db(x) (20*log(max(x, eps))/log(10));
+
+function tanh_approx(x)
+(
+  ex2 = exp(min(max(2*x, -60), 60));
+  (ex2 - 1) / (ex2 + 1);
+);
+
+function F_logcosh(x)
+(
+  ax = abs(x);
+  ax + log(1 + exp(-2*ax)) - log(2);
+);
+
+function adaa1_tanh(x, x_prev)
+local(d, y)
+(
+  d = x - x_prev;
+  abs(d) > 0.000000001 ?
+  (
+    y = (F_logcosh(x) - F_logcosh(x_prev)) / d;
+  )
+  :
+  (
+    y = tanh_approx(0.5*(x + x_prev));
+  );
+  y;
+);
+
+function onepole_coeff_ms(ms)
+(
+  t = max(ms, 0.001) * 0.001;
+  exp(-1/(t*srate));
+);
+
+function env_update(x, env)
+local(d, rel_fast_a, rel_slow_a, blend, eff_a, denom, nd)
+(
+  x > env ?
+  (
+    eff_a = att_a;
+  )
+  :
+  (
+    auto_rel == 0 ?
+    (
+      eff_a = rel_a_base;
+    )
+    :
+    (
+      d = env - x; // positive during release
+      rel_fast_a = onepole_coeff_ms(max(rel_ms*0.25, 10));
+      rel_slow_a = onepole_coeff_ms(min(rel_ms*2.0, 3000));
+
+      denom = max(env, 0.000001);
+      nd = min(d/denom, 1); // 0..1
+      blend = nd;
+      eff_a = rel_slow_a + blend*(rel_fast_a - rel_slow_a);
+    );
+  );
+
+  (1-eff_a)*x + eff_a*env;
+);
+
+function gr_from_level(level_lin)
+local(level_db, over, w, halfw, x, gr)
+(
+  level_db = lin2db(level_lin);
+  over = level_db - thresh_db;
+  w = knee_db;
+  halfw = 0.5*w;
+
+  w <= 0 ?
+  (
+    over <= 0 ?
+    (
+      gr = 0;
+    )
+    :
+    (
+      gr = over*(1 - 1/ratio);
+    );
+  )
+  :
+  (
+    over <= -halfw ?
+    (
+      gr = 0;
+    )
+    :
+    (
+      over >= halfw ?
+      (
+        gr = over*(1 - 1/ratio);
+      )
+      :
+      (
+        x = over + halfw; // 0..w
+        gr = (1 - 1/ratio) * (x*x) / (2*w);
+      );
+    );
+  );
+
+  max(gr, 0);
+);
+
+@slider
+att_a = onepole_coeff_ms(att_ms);
+rel_a_base = onepole_coeff_ms(rel_ms);
+
+// meter smoothing (~100ms)
+gr_meter_a = onepole_coeff_ms(100);
+
+// SC HPF coefficient (1st-order HPF)
+sc_hpf_hz <= 0 ?
+(
+  sc_hp_a = 0;
+)
+:
+(
+  RC = 1/(two_pi*max(sc_hpf_hz, 1));
+  dt = 1/srate;
+  sc_hp_a = RC / (RC + dt);
+);
+
+// Thrust low-split LP (~150 Hz)
+th_fc = 150;
+RC2 = 1/(two_pi*th_fc);
+dt2 = 1/srate;
+th_lp_a = dt2 / (RC2 + dt2);
+
+// Gains
+makeup_lin = db2lin(makeup_db);
+outtrim_lin = db2lin(outtrim_db);
+link = link_pct/100;
+sat = sat_amt/100;
+
+@block
+slider13 = gr_meter_s;
+sliderchange(slider13);
+
+@sample
+inL = spl0;
+inR = spl1;
+
+// ---- Sidechain signal (FF) ----
+scL = inL;
+scR = inR;
+
+// SC HPF on detector audio (Option 1)
+sc_hpf_hz > 0 ?
+(
+  sc_hp_yL = sc_hp_a*(sc_hp_zL + scL - sc_hp_xL);
+  sc_hp_yR = sc_hp_a*(sc_hp_zR + scR - sc_hp_xR);
+
+  sc_hp_zL = sc_hp_yL; sc_hp_zR = sc_hp_yR;
+  sc_hp_xL = scL;      sc_hp_xR = scR;
+
+  scL = sc_hp_yL;
+  scR = sc_hp_yR;
+);
+
+// rectify (peak-ish)
+scAbsL = abs(scL);
+scAbsR = abs(scR);
+
+// Thrust weighting
+g =
+  thrust == 0 ? 0 :
+  thrust == 1 ? 0.7 :
+  1.4;
+
+g > 0 ?
+(
+  th_lp_zL += th_lp_a*(scAbsL - th_lp_zL);
+  th_lp_zR += th_lp_a*(scAbsR - th_lp_zR);
+
+  highL = scAbsL - th_lp_zL;
+  highR = scAbsR - th_lp_zR;
+
+  scAbsL = scAbsL + g*highL;
+  scAbsR = scAbsR + g*highR;
+);
+
+envL = env_update(scAbsL, envL);
+envR = env_update(scAbsR, envR);
+
+// ---- Stereo link ----
+envMax = max(envL, envR);
+detL = link*envMax + (1-link)*envL;
+detR = link*envMax + (1-link)*envR;
+
+grL_db = gr_from_level(detL);
+grR_db = gr_from_level(detR);
+
+gL = db2lin(-grL_db);
+gR = db2lin(-grR_db);
+
+// compress + makeup
+compL = inL * gL * makeup_lin;
+compR = inR * gR * makeup_lin;
+
+// ---- Post-comp ADAA tanh sat linked to GR ----
+sat > 0 ?
+(
+  driveL = 1 + sat * (min(grL_db, 24)/12) * 4;
+  driveR = 1 + sat * (min(grR_db, 24)/12) * 4;
+  driveL = min(driveL, 6);
+  driveR = min(driveR, 6);
+
+  xL = compL * driveL;
+  xR = compR * driveR;
+
+  yL = adaa1_tanh(xL, x1L);
+  yR = adaa1_tanh(xR, x1R);
+  x1L = xL;
+  x1R = xR;
+
+  satL = yL / driveL;
+  satR = yR / driveR;
+)
+:
+(
+  satL = compL;
+  satR = compR;
+);
+
+// output trim
+spl0 = satL * outtrim_lin;
+spl1 = satR * outtrim_lin;
+
+// ---- GR meter (smoothed) ----
+gr_display = 0.5*(grL_db + grR_db);
+gr_display = min(max(gr_display, 0), 24);
+
+gr_meter_s = (1-gr_meter_a)*gr_display + gr_meter_a*gr_meter_s;
+gr_meter = gr_meter_s;
