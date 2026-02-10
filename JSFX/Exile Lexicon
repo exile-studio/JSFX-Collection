@@ -1,0 +1,294 @@
+ desc:Lexi-ish 80s Reverb (Allpass-Loop) [Plate + Bright Rack modes]
+options:maxmem=3000000
+
+slider1:0<0,1,1{Plate,Bright Rack}>Mode
+slider2:25<0,100,0.1>Mix (%)
+slider3:6<0,120,0.1>PreDelay (ms)
+
+slider4:55<0,100,0.1>Decay (%)
+slider5:45<0,100,0.1>Damping (%)
+slider6:55<0,100,0.1>Diffusion (%)
+
+slider7:80<20,400,1>LoCut (Hz)
+slider8:12000<2000,20000,10>HiCut (Hz)
+
+slider9:3<0,40,0.1>Mod Depth (ms)
+slider10:0.35<0.05,2.0,0.01>Mod Rate (Hz)
+
+@init
+two_pi = 2*$pi;
+buf = 0;
+
+function db2lin(db) (10^(db/20));
+function onepole_lp_coeff(hz)
+local(sr, fc, a)
+(
+  sr = max(srate, 1);
+  fc = min(max(hz, 0), sr*0.45);
+  a = 1 - exp(-two_pi*fc/sr);
+  min(max(a, 0), 1);
+);
+
+// --- Allpass helpers (single-sample buffer allpass) ---
+function ap_read(ofs, len, idx)
+(
+  buf[ofs + idx];
+);
+function ap_write(ofs, len, idx, x)
+(
+  buf[ofs + idx] = x;
+);
+function allpass_process(x, ofs, len, w, dSamps, g)
+local(r, z, y)
+(
+  r = w - dSamps; r < 0 ? r += len;
+  z = buf[ofs + r];
+
+  // classic allpass:
+  // y = -g*x + z
+  // z' = x + g*y
+  y = -g*x + z;
+  buf[ofs + w] = x + g*y;
+  y;
+);
+
+// --- Delay helpers ---
+function d_read(ofs, len, w, dSamps)
+local(r)
+(
+  r = w - dSamps; r < 0 ? r += len;
+  buf[ofs + r];
+);
+function d_read_frac(ofs, len, w, dSampsFrac)
+local(r, i0, frac, i1, a, b)
+(
+  r = w - dSampsFrac;
+  r < 0 ? r += len;
+  r >= len ? r -= len;
+
+  i0 = floor(r);
+  frac = r - i0;
+  i1 = i0 + 1; i1 >= len ? i1 = 0;
+
+  a = buf[ofs + i0];
+  b = buf[ofs + i1];
+  a + (b - a)*frac;
+);
+function d_write(ofs, len, w, x) (buf[ofs + w] = x);
+function update_params()
+(
+  mode = slider1;
+  mix = slider2;
+  pred_ms = slider3;
+  decay = slider4;
+  damp = slider5;
+  diff = slider6;
+  lo_cut = slider7;
+  hi_cut = slider8;
+  mod_depth = slider9;
+  mod_rate = slider10;
+
+  mix_w = mix/100;
+
+  // predelay
+  pred_len = max(1, floor(pred_ms*0.001*srate));
+  pred_len = min(pred_len, pred_len_max-1);
+
+  // maps
+  dc = decay/100;
+  dp = damp/100;
+  df = diff/100;
+
+  // bandwidth shaping (no fake grit)
+  lo_a = onepole_lp_coeff(lo_cut);
+  hi_a = onepole_lp_coeff(hi_cut);
+
+  // diffusion allpass coefficient (more diffusion = higher g but keep stable)
+  ap_g = 0.2 + df*0.55;         // 0.2..0.75
+  ap_g = min(ap_g, 0.78);
+
+  // damping LP inside feedback paths: higher damp% = darker (lower cutoff)
+  tank_fc = 1200 + (1-dp)*(12000); // ~1200..13200 Hz
+  tank_a  = onepole_lp_coeff(tank_fc);
+
+  // decay feedback gain
+  // conservative stable mapping; Mode will tweak it
+  fb = 0.25 + dc*0.68;  // 0.25..0.93
+  fb = min(fb, 0.94);
+
+  // mode tweaks (Plate vs Bright Rack)
+  mode == 0 ? (
+    // Plate: a bit smoother, slightly less zing
+    fb *= 0.98;
+    tank_fc *= 0.85;
+  ) : (
+    // Bright Rack: brighter + slightly more "metallic"
+    fb *= 1.02;
+    tank_fc *= 1.15;
+  );
+  tank_a = onepole_lp_coeff(tank_fc);
+
+  // delay lengths (prime-ish / non-commensurate)
+  sz = 0.35 + ( (mode==0 ? 0.55 : 0.60) )*(dc); // base scaling
+  base = floor((1200 + sz*8500)); // samples
+
+  // tank delays
+  d1 = min(max(floor(base*0.93) +  421,  80), d_len-1);
+  d2 = min(max(floor(base*1.07) +  631,  80), d_len-1);
+  d3 = min(max(floor(base*1.23) +  907,  80), d_len-1);
+  d4 = min(max(floor(base*1.41) + 1151,  80), d_len-1);
+
+  // input diffusion delays (shorter)
+  apd1 = min(max(floor(  97 + sz* 400), 20), ap_len-1);
+  apd2 = min(max(floor( 137 + sz* 530), 20), ap_len-1);
+  apd3 = min(max(floor( 179 + sz* 690), 20), ap_len-1);
+  apd4 = min(max(floor( 223 + sz* 820), 20), ap_len-1);
+
+  // modulation
+  md_ms = mod_depth;
+  md = md_ms*0.001*srate; // in samples
+  mr = mod_rate;
+);
+
+// buffers (compact layout for broad JSFX memory compatibility)
+pred_ofs = 0;      pred_len_max = 65536;
+
+ap1_ofs = 70000;   ap_len = 32768;
+ap2_ofs = 103792;
+ap3_ofs = 137584;
+ap4_ofs = 171376;
+
+d1_ofs  = 205168;  d_len = 65536;
+d2_ofs  = 270704;
+d3_ofs  = 336240;
+d4_ofs  = 401776;
+
+// indices
+pred_w = 0;
+ap1_w = ap2_w = ap3_w = ap4_w = 0;
+d1_w = d2_w = d3_w = d4_w = 0;
+
+// filter states
+in_hp_zL = in_hp_zR = 0;
+out_lp_zL = out_lp_zR = 0;
+
+// damping LP inside tank
+lp1 = lp2 = lp3 = lp4 = 0;
+
+// mod phase
+ph = 0;
+update_params();
+
+@slider
+update_params();
+
+@block
+update_params();
+
+@sample
+inL = spl0;
+inR = spl1;
+mix_w = slider2*0.01;
+mix_w = min(max(mix_w, 0), 1);
+
+// input HP (period-correct bandwidth shaping)
+in_hp_zL += lo_a*(inL - in_hp_zL);
+in_hp_zR += lo_a*(inR - in_hp_zR);
+hpL = inL - in_hp_zL;
+hpR = inR - in_hp_zR;
+
+mono = 0.5*(hpL + hpR);
+
+// predelay
+buf[pred_ofs + pred_w] = mono;
+pred_r = pred_w + 1; pred_r >= pred_len ? pred_r = 0;
+x = buf[pred_ofs + pred_r];
+pred_w = pred_r;
+
+// input diffusion (series allpasses)
+// Bright Rack pushes diffusion a bit more (more metallic)
+dg = ap_g + (mode==1 ? 0.06 : 0.02);
+dg = min(dg, 0.82);
+
+x = allpass_process(x, ap1_ofs, ap_len, ap1_w, apd1, dg);
+ap1_w += 1; ap1_w >= ap_len ? ap1_w = 0;
+x = allpass_process(x, ap2_ofs, ap_len, ap2_w, apd2, dg);
+ap2_w += 1; ap2_w >= ap_len ? ap2_w = 0;
+x = allpass_process(x, ap3_ofs, ap_len, ap3_w, apd3, dg);
+ap3_w += 1; ap3_w >= ap_len ? ap3_w = 0;
+x = allpass_process(x, ap4_ofs, ap_len, ap4_w, apd4, dg);
+ap4_w += 1; ap4_w >= ap_len ? ap4_w = 0;
+
+// modulation phase
+ph += mr/srate;
+ph -= floor(ph);
+m = sin(two_pi*ph);
+
+// modulated tap offsets (keep tiny, and only on two lines for decorrelation)
+md1 = d1 + (md * m);
+md2 = d2 + (md * (-m));
+md3 = d3;
+md4 = d4;
+
+md1 = min(max(md1, 80), d_len-1);
+md2 = min(max(md2, 80), d_len-1);
+
+// read tank outputs
+y1 = d_read_frac(d1_ofs, d_len, d1_w, md1);
+y2 = d_read_frac(d2_ofs, d_len, d2_w, md2);
+y3 = d_read(d3_ofs, d_len, d3_w, md3);
+y4 = d_read(d4_ofs, d_len, d4_w, md4);
+
+// extra decorrelated taps to reduce discrete-delay character
+md1b = min(md1 + 53, d_len-1);
+md2b = min(md2 + 67, d_len-1);
+md3b = min(md3 + 79, d_len-1);
+md4b = min(md4 + 97, d_len-1);
+
+y1b = d_read_frac(d1_ofs, d_len, d1_w, md1b);
+y2b = d_read_frac(d2_ofs, d_len, d2_w, md2b);
+y3b = d_read(d3_ofs, d_len, d3_w, md3b);
+y4b = d_read(d4_ofs, d_len, d4_w, md4b);
+
+// Hadamard mix (Lexi-ish density build)
+m1 = ( y1 + y2 + y3 + y4) * 0.5;
+m2 = ( y1 - y2 + y3 - y4) * 0.5;
+m3 = ( y1 + y2 - y3 - y4) * 0.5;
+m4 = ( y1 - y2 - y3 + y4) * 0.5;
+
+// damping in feedback
+lp1 += tank_a*(m1 - lp1);
+lp2 += tank_a*(m2 - lp2);
+lp3 += tank_a*(m3 - lp3);
+lp4 += tank_a*(m4 - lp4);
+
+// inject (a touch of crossfeed helps stereo feel)
+inj = x * 0.55;
+
+// write back
+w1 = lp1*fb + inj;
+w2 = lp2*fb + inj;
+w3 = lp3*fb + inj;
+w4 = lp4*fb + inj;
+
+d_write(d1_ofs, d_len, d1_w, w1);
+d_write(d2_ofs, d_len, d2_w, w2);
+d_write(d3_ofs, d_len, d3_w, w3);
+d_write(d4_ofs, d_len, d4_w, w4);
+
+d1_w += 1; d1_w >= d_len ? d1_w = 0;
+d2_w += 1; d2_w >= d_len ? d2_w = 0;
+d3_w += 1; d3_w >= d_len ? d3_w = 0;
+d4_w += 1; d4_w >= d_len ? d4_w = 0;
+
+// stereo taps (decorrelated, non-cancelling)
+wet_preL = (0.38*y1 + 0.22*y3 + 0.12*y4 + 0.18*y2b + 0.10*y4b) * 0.9;
+wet_preR = (0.38*y2 + 0.22*y4 + 0.12*y3 + 0.18*y1b + 0.10*y3b) * 0.9;
+
+// output LP bypassed for now (it was muting wet on this setup)
+wetL = wet_preL;
+wetR = wet_preR;
+
+// mix
+spl0 = inL*(1-mix_w) + wetL*mix_w;
+spl1 = inR*(1-mix_w) + wetR*mix_w;
